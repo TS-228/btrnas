@@ -1,13 +1,20 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="webui/src/lib/assets/nasty-white.svg" />
-    <source media="(prefers-color-scheme: light)" srcset="webui/src/lib/assets/nasty.svg" />
-    <img src="webui/src/lib/assets/nasty-white.svg" width="300" alt="NASty" />
+    <source media="(prefers-color-scheme: dark)" srcset="webui/src/lib/assets/btrnas-white.svg" />
+    <source media="(prefers-color-scheme: light)" srcset="webui/src/lib/assets/btrnas.svg" />
+    <img src="webui/src/lib/assets/btrnas-white.svg" width="300" alt="btrNAS" />
   </picture>
 </p>
 
 <p align="center">
   <strong>A NAS appliance built on Debian, btrfs, and ksmbd.</strong>
+</p>
+
+<p align="center">
+  <img src="webui/src/lib/assets/icons/nas-bays.svg" width="72" alt="NAS enclosure with disk bays" />
+  <img src="webui/src/lib/assets/icons/disk-stack.svg" width="72" alt="Stacked hard disks" />
+  <img src="webui/src/lib/assets/icons/nas-network.svg" width="72" alt="NAS with network and a disk" />
+  <img src="webui/src/lib/assets/icons/platter-tree.svg" width="72" alt="Disk platters in a storage tree" />
 </p>
 
 ---
