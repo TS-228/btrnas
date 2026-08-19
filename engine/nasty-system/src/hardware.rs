@@ -278,11 +278,10 @@ pub struct HardwareSummary {
     /// is enumerated by the kernel at all (no chip, disabled in
     /// firmware, missing driver).
     pub tpm: Option<TpmInfo>,
-    /// Secure Boot state as reported by `sbctl status --json`. Always
-    /// present — failure modes (BIOS boot, sbctl missing, sbctl
-    /// errored) collapse into a struct with `enabled = None` and a
-    /// human-readable `note` rather than an absent field. The WebUI
-    /// renders one of: enabled / disabled / unknown.
+    /// Secure Boot state as reported by `bootctl status`. Always
+    /// present — failure modes (BIOS boot, bootctl missing/errored)
+    /// collapse into a struct with `enabled = None` and a
+    /// human-readable `note` rather than an absent field.
     pub secure_boot: nasty_common::secure_boot::SecureBootStatus,
 }
 

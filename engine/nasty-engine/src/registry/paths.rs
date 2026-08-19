@@ -172,7 +172,6 @@ mod tests {
         assert_eq!(translate("firmware.constraints").0, HttpVerb::Get);
         assert_eq!(translate("firmware.devices").0, HttpVerb::Get);
         assert_eq!(translate("firmware.available").0, HttpVerb::Get);
-        assert_eq!(translate("system.secure_boot.readiness").0, HttpVerb::Get);
         assert_eq!(translate("subvolume.children").0, HttpVerb::Get);
         assert_eq!(translate("fs.dependents").0, HttpVerb::Get);
         assert_eq!(translate("fs.locked_dependents").0, HttpVerb::Get);

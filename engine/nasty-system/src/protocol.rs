@@ -1,4 +1,4 @@
-//! Dynamic protocol management: enable/disable NFS, SMB, iSCSI, NVMe-oF at runtime.
+//! Dynamic protocol management: enable/disable NFS, SMB, FTP, SFTP, S3, iSCSI, NVMe-oF at runtime.
 //!
 //! Persists state to `/var/lib/nasty/protocols.json` so boot-time services
 //! know which protocols to start.
@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 const STATE_PATH: &str = "/var/lib/nasty/protocols.json";
-const SMB_NASTY_CONF: &str = "/etc/samba/smb.nasty.conf";
+const KSMBD_CONF: &str = "/etc/ksmbd/ksmbd.conf";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -17,6 +17,9 @@ pub enum Protocol {
     Smb,
     Iscsi,
     Nvmeof,
+    Ftp,
+    Sftp,
+    S3,
     Nut,
     Ssh,
     Avahi,
@@ -30,6 +33,9 @@ impl Protocol {
         Protocol::Smb,
         Protocol::Iscsi,
         Protocol::Nvmeof,
+        Protocol::Ftp,
+        Protocol::Sftp,
+        Protocol::S3,
         Protocol::Nut,
         Protocol::Ssh,
         Protocol::Avahi,
@@ -54,6 +60,9 @@ impl Protocol {
             Protocol::Smb => "smb",
             Protocol::Iscsi => "iscsi",
             Protocol::Nvmeof => "nvmeof",
+            Protocol::Ftp => "ftp",
+            Protocol::Sftp => "sftp",
+            Protocol::S3 => "s3",
             Protocol::Nut => "nut",
             Protocol::Ssh => "ssh",
             Protocol::Avahi => "avahi",
@@ -68,6 +77,9 @@ impl Protocol {
             Protocol::Smb => "SMB",
             Protocol::Iscsi => "iSCSI",
             Protocol::Nvmeof => "NVMe-oF",
+            Protocol::Ftp => "FTP",
+            Protocol::Sftp => "SFTP",
+            Protocol::S3 => "S3",
             Protocol::Nut => "UPS (NUT)",
             Protocol::Ssh => "SSH",
             Protocol::Avahi => "mDNS (Avahi)",
@@ -80,18 +92,12 @@ impl Protocol {
     fn services(&self) -> &[&str] {
         match self {
             Protocol::Nfs => &["nfs-server.service"],
-            Protocol::Smb => &[
-                "samba-smbd.service",
-                "samba-nmbd.service",
-                // wsdd advertises SMB shares to Windows 10/11 file
-                // managers via WS-Discovery (Win dropped NetBIOS
-                // browsing). Started/stopped alongside Samba so
-                // toggling the SMB protocol consistently affects all
-                // discovery surfaces.
-                "samba-wsdd.service",
-            ],
+            Protocol::Smb => &["ksmbd.service", "wsdd2.service"],
             Protocol::Iscsi => &["target.service"],
             Protocol::Nvmeof => &[], // configfs-based, no daemon
+            Protocol::Ftp => &["nasty-rclone@ftp.service"],
+            Protocol::Sftp => &["nasty-rclone@sftp.service"],
+            Protocol::S3 => &["nasty-rclone@s3.service"],
             // NUT runs a different subset of services in local vs
             // remote modes — see `nut::services_for_mode`.  Remote
             // mode only needs upsmon; upsd/driver have nothing local
@@ -111,6 +117,9 @@ impl Protocol {
             "smb" => Some(Protocol::Smb),
             "iscsi" => Some(Protocol::Iscsi),
             "nvmeof" => Some(Protocol::Nvmeof),
+            "ftp" => Some(Protocol::Ftp),
+            "sftp" => Some(Protocol::Sftp),
+            "s3" => Some(Protocol::S3),
             "nut" => Some(Protocol::Nut),
             "ssh" => Some(Protocol::Ssh),
             "avahi" => Some(Protocol::Avahi),
@@ -146,6 +155,12 @@ struct ProtocolState {
     #[serde(default)]
     nvmeof: bool,
     #[serde(default)]
+    ftp: bool,
+    #[serde(default)]
+    sftp: bool,
+    #[serde(default)]
+    s3: bool,
+    #[serde(default)]
     nut: bool,
     #[serde(default = "default_true")]
     ssh: bool,
@@ -168,6 +183,9 @@ impl Default for ProtocolState {
             smb: false,
             iscsi: false,
             nvmeof: false,
+            ftp: false,
+            sftp: false,
+            s3: false,
             nut: false,
             ssh: true,
             avahi: true,
@@ -184,6 +202,9 @@ impl ProtocolState {
             Protocol::Smb => self.smb,
             Protocol::Iscsi => self.iscsi,
             Protocol::Nvmeof => self.nvmeof,
+            Protocol::Ftp => self.ftp,
+            Protocol::Sftp => self.sftp,
+            Protocol::S3 => self.s3,
             Protocol::Nut => self.nut,
             Protocol::Ssh => self.ssh,
             Protocol::Avahi => self.avahi,
@@ -198,6 +219,9 @@ impl ProtocolState {
             Protocol::Smb => self.smb = enabled,
             Protocol::Iscsi => self.iscsi = enabled,
             Protocol::Nvmeof => self.nvmeof = enabled,
+            Protocol::Ftp => self.ftp = enabled,
+            Protocol::Sftp => self.sftp = enabled,
+            Protocol::S3 => self.s3 = enabled,
             Protocol::Nut => self.nut = enabled,
             Protocol::Ssh => self.ssh = enabled,
             Protocol::Avahi => self.avahi = enabled,
@@ -350,20 +374,6 @@ impl ProtocolService {
     pub async fn enable(&self, name: &str) -> Result<ProtocolStatus, String> {
         let proto = Protocol::from_name(name).ok_or_else(|| format!("unknown protocol: {name}"))?;
 
-        // A hosted AD domain's samba-dc.service already serves SMB (shares
-        // included) through its own smbd, and Conflicts= swaps it out for
-        // member-mode smbd/nmbd/winbindd — enabling the standalone SMB
-        // toggle here would silently stop the DC. Demoting clears dc.json
-        // and lifts this guard (disable is intentionally left unguarded).
-        if proto == Protocol::Smb && crate::dc::DcService::load_config().await.is_some() {
-            return Err(
-                "this box hosts an Active Directory domain — its domain controller \
-                         serves SMB (shares included); demote it on the Settings → Directory \
-                         panel before enabling standalone SMB"
-                    .to_string(),
-            );
-        }
-
         let mut state = load_state().await;
         state.set(proto, true);
         save_state(&state).await?;
@@ -414,14 +424,8 @@ impl ProtocolService {
             started.push(*svc);
         }
 
-        // Enabling SMB just started samba-wsdd (Windows WS-Discovery) and
-        // smbd, but avahi-daemon has been running since boot announcing
-        // its pre-SMB state, and a cold wsdd can miss its first multicast
-        // Hello before IGMP membership settles. Rebind both onto the
-        // current network so the box is discoverable from Windows
-        // Explorer immediately, instead of only after a reboot (#291).
-        // Same remedy the network-apply path uses; restarts only the
-        // daemons already active.
+        // Enabling SMB just started ksmbd; avahi may still advertise a
+        // pre-SMB view until rebound onto the current network (#291).
         if proto == Protocol::Smb {
             crate::network::rebind_discovery_daemons().await;
         }
@@ -480,12 +484,15 @@ impl ProtocolService {
 async fn is_protocol_running(proto: Protocol) -> bool {
     match proto {
         Protocol::Nfs => systemctl_is_active("nfs-server.service").await,
-        Protocol::Smb => systemctl_is_active("samba-smbd.service").await,
+        Protocol::Smb => systemctl_is_active("ksmbd.service").await,
         Protocol::Iscsi => systemctl_is_active("target.service").await,
         Protocol::Nvmeof => {
             // NVMe-oF is "running" if nvmet configfs is available
             std::path::Path::new("/sys/kernel/config/nvmet").exists()
         }
+        Protocol::Ftp => systemctl_is_active("nasty-rclone@ftp.service").await,
+        Protocol::Sftp => systemctl_is_active("nasty-rclone@sftp.service").await,
+        Protocol::S3 => systemctl_is_active("nasty-rclone@s3.service").await,
         Protocol::Nut => {
             // Pick the canary unit based on mode — upsd doesn't run
             // in remote mode, so checking nut-server there would
@@ -502,11 +509,11 @@ async fn is_protocol_running(proto: Protocol) -> bool {
 /// Ensure prerequisites exist before starting a protocol's services.
 async fn prepare_protocol(proto: Protocol) {
     if proto == Protocol::Smb {
-        // Samba config includes smb.nasty.conf — must exist or smbd fails to start
-        if !std::path::Path::new(SMB_NASTY_CONF).exists() {
-            let header = "# Managed by NASty — do not edit manually\n";
-            if let Err(e) = tokio::fs::write(SMB_NASTY_CONF, header).await {
-                warn!("Failed to create {SMB_NASTY_CONF}: {e}");
+        // ksmbd.mountd requires a parseable ksmbd.conf before start.
+        if !std::path::Path::new(KSMBD_CONF).exists() {
+            let header = "# Managed by NASty — do not edit manually\n\n[global]\n    workgroup = WORKGROUP\n    server string = NASty\n";
+            if let Err(e) = tokio::fs::write(KSMBD_CONF, header).await {
+                warn!("Failed to create {KSMBD_CONF}: {e}");
             }
         }
     }
@@ -647,15 +654,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn smb_protocol_includes_wsdd_in_its_service_set() {
-        // Toggling SMB in the WebUI must start/stop the WSDD daemon
-        // alongside Samba — otherwise the host stays invisible to
-        // Windows 10/11 Explorer (issue #70). Pin the membership so
-        // a future refactor of `services()` doesn't silently break
-        // discovery.
+    fn smb_protocol_uses_ksmbd_service() {
         let svcs = Protocol::Smb.services();
-        assert!(svcs.contains(&"samba-smbd.service"));
-        assert!(svcs.contains(&"samba-nmbd.service"));
-        assert!(svcs.contains(&"samba-wsdd.service"));
+        assert_eq!(svcs, &["ksmbd.service", "wsdd2.service"]);
+    }
+
+    #[test]
+    fn rclone_protocols_use_templated_units() {
+        assert_eq!(Protocol::Ftp.services(), &["nasty-rclone@ftp.service"]);
+        assert_eq!(Protocol::Sftp.services(), &["nasty-rclone@sftp.service"]);
+        assert_eq!(Protocol::S3.services(), &["nasty-rclone@s3.service"]);
+        assert_eq!(Protocol::from_name("ftp"), Some(Protocol::Ftp));
+        assert_eq!(Protocol::from_name("sftp"), Some(Protocol::Sftp));
+        assert_eq!(Protocol::from_name("s3"), Some(Protocol::S3));
     }
 }

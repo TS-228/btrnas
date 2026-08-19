@@ -7,12 +7,12 @@
 </p>
 
 <p align="center">
-  <strong>A NAS appliance built on bcachefs.</strong>
+  <strong>A NAS appliance built on Debian, btrfs, and ksmbd.</strong>
 </p>
 
 ---
 
-NASty is a NAS operating system built on NixOS and bcachefs. It turns commodity hardware into a storage appliance serving NFS, SMB, iSCSI, and NVMe-oF — managed from a single web UI, updated atomically, and rolled back when things go sideways.
+NASty is a NAS operating system built on **Debian Trixie** (this fork targets armhf / QNAP TS-228). It turns commodity hardware into a storage appliance serving NFS, SMB, FTP, SFTP, S3, iSCSI, and NVMe-oF — managed from a single web UI, updated via apt, and rolled back with snapper btrfs snapshots.
 
 ## Star History
 
@@ -27,12 +27,11 @@ NASty is a NAS operating system built on NixOS and bcachefs. It turns commodity 
 ## Features
 
 ### Storage
-- **bcachefs** — compression, checksumming, erasure coding, tiering, encryption, O(1) snapshots
-- **File sharing** — NFS and SMB with per-share ACLs
+- **btrfs** — compression, checksumming, multi-device profiles, subvolumes, and snapshots under `/fs/`
+- **File sharing** — NFS, SMB (ksmbd), FTP, SFTP, and S3 (rclone serve) with per-share configuration
 - **Block storage** — iSCSI and NVMe-oF with dedicated targets per volume, per-target portal management, and optional RDMA transports (iSER, NVMe-oF/RDMA, NFS-RDMA) for RoCE and InfiniBand NICs
-- **Subvolumes** — filesystem and block subvolumes with quotas, compression, and tiering per subvolume
-- **Snapshots** — instant, space-efficient point-in-time copies
-- **Encryption lifecycle** — lock and unlock encrypted filesystems from the WebUI, with a dependents preview that lists every app, VM, share, and backup that would break before you confirm. Optional **TPM2-sealed keys** auto-unlock on boot when the measured-boot state matches
+- **Subvolumes** — filesystem and block subvolumes with optional compression
+- **Snapshots** — space-efficient point-in-time copies (`subvol@snap`)
 - **File browser** — browse, upload, edit, rename, copy, move, and bulk-manage files from the web UI
 - **Backups** — encrypted, deduplicated, incremental backups to local, S3, SFTP, REST, or Backblaze B2 with per-profile schedules and retention — plus whole-snapshot restore, including disaster recovery onto a fresh box from an existing repository
 
@@ -52,18 +51,17 @@ NASty is a NAS operating system built on NixOS and bcachefs. It turns commodity 
 ### System
 - **Web UI** — manage filesystems, subvolumes, snapshots, shares, disks, services, and more
 - **Web terminal** — built-in shell with command cheatsheets and diagnostic tools
-- **Custom NixOS config** — advanced users can drop settings the WebUI doesn't expose into `/etc/nixos/custom.nix`; NASty never overwrites it, so they persist across reboots and upgrades
+- **Custom config** — optional `/etc/nasty/custom.conf` for notes/local overrides; NASty never overwrites it
 - **Glossary** — built-in help page with storage terms, protocol guidance, and FAQ
 - **Networking** — NetworkManager-based with confirm-or-rollback: edits stage, apply, and auto-revert if you don't confirm in time, so a typo can't lock you out over SSH
 - **Let's Encrypt** — automatic TLS certificates via ACME (TLS-ALPN and DNS challenges)
 - **Tailscale** — built-in VPN with one-click setup
 - **Access control** — local user accounts with role-based permissions, API tokens, OIDC single sign-on, **WebAuthn / passkey** sign-in with admin-side credential reset, and an append-only audit log of every mutation, login attempt, and privileged-console open
-- **Active Directory** _(experimental)_ — join an existing domain as a member, or host your own: NASty as the domain controller with integrated DNS and Kerberos, WebUI user/group/computer management, domain backups, and RSAT compatibility for advanced administration
 - **Firewall** — engine-managed nftables, deny-by-default, with per-service source/interface restrictions and user-defined custom port rules for anything running outside NASty's service model
 - **UPS monitoring** — NUT integration for graceful shutdown on power loss (opt-in)
-- **Atomic updates** — NixOS-based, with one-click rollback to any previous generation
-- **Secure Boot** _(experimental)_ — per-box opt-in lanzaboote-enforcing boot chain with a guided enrollment wizard from the Hardware page
-- **Binary cache** — fast updates via cachix on both x86_64 and aarch64 (engine, webui, bcachefs-tools pre-built — no Rust + npm compile on Pi / Odroid / Rockchip boxes)
+- **Updates** — apt-based, with snapper btrfs snapshots and one-click rollback
+
+> This TS-228 fork drops Samba AD / Time Machine (no vfs_fruit), native FS encryption/TPM, erasure coding, and bcachefs tiering. Local SMB users and btrfs pools are the supported path.
 
 ## Kubernetes
 
@@ -120,12 +118,12 @@ Building something with NASty? Open an issue or PR and we'll add it here.
 
 ## Getting Started
 
-1. Download the latest ISO from [Releases](../../releases)
-2. Boot it on your hardware — the installer lets you pick a disk and press Enter
+1. Build `.deb` packages (see [INSTALL.md](INSTALL.md)) and install onto a Debian Trixie armhf rootfs
+2. Enable `nasty-engine` / `nasty-metrics` (and Caddy)
 3. Open the WebUI at `https://<nasty-ip>`
 4. Default credentials: **admin** / **admin**
 
-ISO won't boot? Some UEFI firmware doesn't like NixOS ISOs. See [INSTALL.md](INSTALL.md) for an alternative installation method from any Linux live environment.
+This fork does not ship a NixOS ISO. Root must be btrfs for snapper rollback.
 
 ## Update Flavors
 
@@ -145,8 +143,8 @@ Switch flavors from **Settings → Update → Flavor** in the WebUI.
 |-----------|------------|-----|
 | Engine | Rust | Async runtime, handles all storage and system operations |
 | Web UI | SvelteKit + TypeScript | Reactive UI with real-time WebSocket updates |
-| OS | NixOS | Atomic updates, rollback, reproducible system config |
-| Filesystem | bcachefs | Checksumming, compression, tiering, snapshots, erasure coding |
+| OS | Debian Trixie | apt updates, snapper btrfs rollback (armhf / TS-228) |
+| Filesystem | btrfs | Checksumming, compression, subvolumes, snapshots |
 | API | JSON-RPC 2.0 over WebSocket | Persistent connection, bidirectional, low overhead |
 
 ## Project Structure
@@ -154,14 +152,14 @@ Switch flavors from **Settings → Update → Flavor** in the WebUI.
 ```
 engine/         Rust workspace — storage, sharing, system management
 webui/          SvelteKit web interface
-nixos/          NixOS modules and ISO configuration
+debian/         Debian packaging (armhf .deb)
 ```
 
 The full ecosystem (CSI driver, Helm chart, kubectl plugin, and more) lives at [github.com/nasty-project](https://github.com/nasty-project).
 
 ## FAQ
 
-See [FAQ.md](FAQ.md) for common questions about bcachefs, NixOS, and project status.
+See [FAQ.md](FAQ.md) for common questions about this Debian port and project status.
 
 ## Telemetry
 

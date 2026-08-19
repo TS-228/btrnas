@@ -37,16 +37,13 @@ pub struct FirmwareUpdateResult {
 }
 
 /// Constraints on firmware updates from the surrounding system —
-/// today, just whether Secure Boot is blocking the apply path.
+/// today, just whether firmware Secure Boot is blocking the apply path.
 /// Returned by `firmware.constraints` so the WebUI can disable the
 /// per-row Apply button (with an explanatory tooltip) instead of
 /// letting the operator click and surface the error in a toast.
 ///
-/// SB-blocking exists because of upstream lanzaboote#591: the
-/// EFI-capsule shim fwupd uses to apply updates can't be launched
-/// from a lanzaboote-managed boot chain under enforcing Secure Boot.
 /// Listing devices / refreshing metadata still works — only the
-/// final `fwupdmgr update` step breaks.
+/// final `fwupdmgr update` step may be blocked under enforcing SB.
 #[derive(Debug, Serialize, JsonSchema)]
 pub struct FirmwareConstraints {
     /// True when the engine has detected Secure Boot is enforcing.
@@ -175,21 +172,16 @@ impl FirmwareService {
     }
 
     /// Apply a firmware update to a specific device.
-    /// Snapshot of update-blocking constraints. Today only Secure
-    /// Boot is in play (upstream lanzaboote#591 breaks fwupd's
-    /// capsule-apply path); future constraints — pending reboot
-    /// already queued, disk-space gates, etc. — would slot in
-    /// here so the WebUI gets them in one call.
+    /// Snapshot of update-blocking constraints. Today only firmware
+    /// Secure Boot enforcement may block the fwupd apply path.
     pub async fn constraints(&self) -> FirmwareConstraints {
         let sb = nasty_common::secure_boot::status().await;
         if sb.enabled == Some(true) {
             FirmwareConstraints {
                 sb_blocks_apply: true,
                 sb_blocks_apply_reason:
-                    "Firmware updates can't be applied while Secure Boot is enforcing — \
-                     fwupd's EFI-capsule shim isn't compatible with lanzaboote's \
-                     boot chain (upstream issue lanzaboote#591). Disable Secure \
-                     Boot in firmware to apply updates, then re-enroll afterward."
+                    "Firmware updates can't be applied while Secure Boot is enforcing. \
+                     Disable Secure Boot in firmware to apply updates, then re-enable afterward."
                         .to_string(),
             }
         } else {
@@ -211,7 +203,7 @@ impl FirmwareService {
         if constraints.sb_blocks_apply {
             warn!(
                 target: "nasty::firmware",
-                "firmware.update refused for {device_id}: Secure Boot enforcing (lanzaboote#591)"
+                "firmware.update refused for {device_id}: Secure Boot enforcing"
             );
             return FirmwareUpdateResult {
                 device_name: device_id.to_string(),

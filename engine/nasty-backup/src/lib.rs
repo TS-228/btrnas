@@ -1560,7 +1560,7 @@ mod tests {
 
     #[test]
     fn backup_sources_must_not_be_empty() {
-        assert!(validate_sources(&["/var/lib/nasty".into(), "/etc/nixos".into()]).is_ok());
+        assert!(validate_sources(&["/var/lib/nasty".into(), "/etc/nasty".into()]).is_ok());
         assert!(validate_sources(&[]).is_err());
         assert!(validate_sources(&["".into()]).is_err());
         assert!(validate_sources(&["relative/path".into()]).is_ok());
@@ -1615,7 +1615,7 @@ mod tests {
         assert!(unchanged.last_run.is_some());
 
         let mut changed = existing.clone();
-        changed.sources.push("/etc/nixos".into());
+        changed.sources.push("/etc/nasty".into());
         invalidate_last_run_if_definition_changed(&mut changed, &existing);
         assert!(changed.last_run.is_none());
 

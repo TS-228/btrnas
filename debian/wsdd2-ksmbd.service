@@ -1,0 +1,22 @@
+# Overrides Debian's wsdd2 unit (which BindsTo=smbd). NASty uses ksmbd.
+# Installed to /etc/systemd/system/wsdd2.service so it fully replaces the
+# vendor unit — drop-ins cannot clear BindsTo=smbd on systemd 257.
+[Unit]
+Description=WSD/LLMNR Discovery/Name Service Daemon (ksmbd)
+BindsTo=ksmbd.service
+After=ksmbd.service
+PartOf=ksmbd.service
+
+[Service]
+ExecStart=/usr/sbin/wsdd2
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+DynamicUser=true
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=ksmbd.service

@@ -4,10 +4,11 @@
 	import { getClient } from '$lib/client';
 	import { withToast, error } from '$lib/toast.svelte';
 	import { confirm } from '$lib/confirm.svelte';
-	import type { ProtocolStatus, AppsStatus, Filesystem, TuningConfig, NutConfig, UpsStatus } from '$lib/types';
+	import type { ProtocolStatus, AppsStatus, Filesystem, TuningConfig, NutConfig, UpsStatus, RcloneProto } from '$lib/types';
 	import { Button } from '$lib/components/ui/button';
 	import { Badge } from '$lib/components/ui/badge';
 	import { Input } from '$lib/components/ui/input';
+	import { rcloneStore, rcloneLoadSettings, rcloneSaveSettings, rcloneLabel } from '$lib/sharing/rclone.svelte';
 
 	let protocols: ProtocolStatus[] = $state([]);
 	let dockerStatus: AppsStatus | null = $state(null);
@@ -178,6 +179,7 @@
 		if (name === 'nut') loadNut();
 		if (name === 'ssh') loadSsh();
 		if (name === 'rest-server' && !restConfigLoaded) loadRestConfig();
+		if (name === 'ftp' || name === 'sftp' || name === 's3') rcloneLoadSettings(name);
 	}
 
 	// Backup Server config
@@ -420,7 +422,7 @@
 							>
 								{proto.enabled ? 'Disable' : 'Enable'}
 							</Button>
-							{#if ['nfs', 'smb', 'iscsi', 'nvmeof', 'nut', 'ssh', 'rest-server'].includes(proto.name)}
+							{#if ['nfs', 'smb', 'iscsi', 'nvmeof', 'ftp', 'sftp', 's3', 'nut', 'ssh', 'rest-server'].includes(proto.name)}
 								<Button variant="secondary" size="xs" onclick={() => toggleConfig(proto.name)}>
 									{configOpen === proto.name ? 'Close' : 'Configure'}
 								</Button>
@@ -562,6 +564,56 @@
 											<Button size="xs" onclick={addSshKey} disabled={!sshNewKey.trim()}>Add Key</Button>
 										</div>
 									</div>
+								</div>
+							{:else if proto.name === 'ftp' || proto.name === 'sftp' || proto.name === 's3'}
+								{@const kind = proto.name as RcloneProto}
+								{@const rs = rcloneStore(kind)}
+								<div class="max-w-xl space-y-3">
+									<p class="text-xs text-muted-foreground">
+										{rcloneLabel(kind)} is served by rclone. Shares are configured on the Sharing page; listen address, port, and credentials live here.
+									</p>
+									<div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+										<div>
+											<label class="mb-1 block text-xs text-muted-foreground" for="rclone-{kind}-listen">Listen</label>
+											<input id="rclone-{kind}-listen" bind:value={rs.listen} class="h-8 w-full rounded-md border border-input bg-background px-2 text-sm font-mono" />
+										</div>
+										<div>
+											<label class="mb-1 block text-xs text-muted-foreground" for="rclone-{kind}-port">Port</label>
+											<input id="rclone-{kind}-port" type="number" bind:value={rs.port} class="h-8 w-full rounded-md border border-input bg-background px-2 text-sm font-mono" />
+										</div>
+									</div>
+									{#if kind === 'ftp'}
+										<label class="flex cursor-pointer items-center gap-2 text-sm">
+											<input type="checkbox" bind:checked={rs.anonymous} class="rounded border-input" />
+											Allow anonymous login
+										</label>
+										<div class="grid grid-cols-2 gap-3">
+											<div>
+												<label class="mb-1 block text-xs text-muted-foreground" for="rclone-ftp-pasv-min">Passive min</label>
+												<input id="rclone-ftp-pasv-min" type="number" bind:value={rs.passiveMin} class="h-8 w-full rounded-md border border-input bg-background px-2 text-sm font-mono" />
+											</div>
+											<div>
+												<label class="mb-1 block text-xs text-muted-foreground" for="rclone-ftp-pasv-max">Passive max</label>
+												<input id="rclone-ftp-pasv-max" type="number" bind:value={rs.passiveMax} class="h-8 w-full rounded-md border border-input bg-background px-2 text-sm font-mono" />
+											</div>
+										</div>
+									{/if}
+									{#if kind !== 'ftp' || !rs.anonymous}
+										<div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+											<div>
+												<label class="mb-1 block text-xs text-muted-foreground" for="rclone-{kind}-user">{kind === 's3' ? 'Access key' : 'Username'}</label>
+												<input id="rclone-{kind}-user" bind:value={rs.username} class="h-8 w-full rounded-md border border-input bg-background px-2 text-sm font-mono" />
+											</div>
+											<div>
+												<label class="mb-1 block text-xs text-muted-foreground" for="rclone-{kind}-pass">{kind === 's3' ? 'Secret key' : 'Password'}</label>
+												<input id="rclone-{kind}-pass" type={rs.passwordRevealed ? 'text' : 'password'} bind:value={rs.password} class="h-8 w-full rounded-md border border-input bg-background px-2 text-sm font-mono" />
+											</div>
+										</div>
+										<Button size="xs" variant="secondary" onclick={() => rs.passwordRevealed = !rs.passwordRevealed}>
+											{rs.passwordRevealed ? 'Hide secret' : 'Show secret'}
+										</Button>
+									{/if}
+									<Button size="sm" onclick={() => rcloneSaveSettings(kind)}>Save</Button>
 								</div>
 							{:else if proto.name === 'rest-server'}
 								<div class="space-y-4">

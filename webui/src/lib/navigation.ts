@@ -83,7 +83,7 @@ const NAVIGATION: NavEntry[] = [
 			item('files', '/files', 'Files', FolderOpen, ['file', 'browser', 'folder', 'directory', 'upload', 'download', 'rename', 'move', 'copy', 'permissions'], { commonRank: 4 })
 		]
 	},
-	item('sharing', '/sharing', 'Sharing', Share2, ['share', 'nfs', 'smb', 'samba', 'cifs', 'iscsi', 'nvmeof', 'nvme-of', 'export', 'target', 'lun', 'acl', 'chap', 'portal', 'subsystem', 'nqn', 'iqn', 'client', 'username']),
+	item('sharing', '/sharing', 'Sharing', Share2, ['share', 'nfs', 'smb', 'samba', 'cifs', 'ftp', 'sftp', 's3', 'rclone', 'iscsi', 'nvmeof', 'nvme-of', 'export', 'target', 'lun', 'acl', 'chap', 'portal', 'subsystem', 'nqn', 'iqn', 'client', 'username']),
 	{
 		kind: 'group',
 		id: 'protection',
@@ -116,11 +116,11 @@ const NAVIGATION: NavEntry[] = [
 		icon: Wrench,
 		children: [
 			item('services', '/services', 'Services', Server, ['service', 'protocol', 'nfs', 'smb', 'iscsi', 'smart', 'avahi', 'mdns', 'enable', 'disable', 'rest server', 'backup server', 'receiver', 'htpasswd', 'docker', 'container', 'runtime', 'ups', 'nut', 'battery', 'power', 'shutdown', 'uninterruptible']),
-			item('hardware', '/hardware', 'Hardware', CircuitBoard, ['hardware', 'pci', 'iommu', 'group', 'passthrough', 'vfio', 'gpu', 'device', 'driver', 'lspci', 'tpm', 'tpm2', 'secure boot', 'secureboot', 'cpu', 'memory', 'ram', 'dmi', 'bios', 'firmware', 'motherboard', 'mainboard', 'usb', 'nic']),
+			item('hardware', '/hardware', 'Hardware', CircuitBoard, ['hardware', 'pci', 'iommu', 'group', 'passthrough', 'vfio', 'gpu', 'device', 'driver', 'lspci', 'tpm', 'tpm2', 'cpu', 'memory', 'ram', 'dmi', 'bios', 'firmware', 'motherboard', 'mainboard', 'usb', 'nic']),
 			item('logs', '/logs', 'Logs', ScrollText, ['log', 'journal', 'systemd', 'debug', 'error', 'follow', 'stream', 'filter', 'level', 'tail', 'kernel', 'dmesg'], { commonRank: 8 }),
-			item('update', '/update', 'Update', RefreshCw, ['update', 'upgrade', 'version', 'release', 'nixos', 'rebuild', 'generation', 'nasty', 'nixpkgs', 'bcachefs', 'flake', 'lock', 'rollback', 'pin']),
+			item('update', '/update', 'Update', RefreshCw, ['update', 'upgrade', 'version', 'release', 'apt', 'debian', 'snapper', 'generation', 'nasty', 'rollback']),
 			item('users', '/users', 'Access Control', ShieldCheck, ['user', 'password', 'role', 'admin', 'group', 'permission', 'token', 'api', 'access', 'auth', 'login', 'security key', 'webauthn', 'passkey', 'yubikey', 'touch id', 'windows hello', 'authenticator', 'fido', '2fa', 'mfa', 'sso', 'oidc', 'single sign-on', 'provider']),
-			item('settings', '/settings', 'Settings', Settings, ['setting', 'hostname', 'timezone', 'clock', 'directory', 'active directory', 'domain', 'ad', 'network', 'ip', 'dhcp', 'dns', 'bond', 'vlan', 'bridge', 'static', 'gateway', 'route', 'mtu', 'notification', 'email', 'smtp', 'telegram', 'webhook', 'tuning', 'nfs threads', 'metrics', 'prometheus', 'telemetry', 'log level', 'theme', 'dark', 'light', 'appearance', 'custom nix', 'custom.nix', 'nixos', 'package', 'systemd'])
+			item('settings', '/settings', 'Settings', Settings, ['setting', 'hostname', 'timezone', 'clock', 'directory', 'active directory', 'domain', 'ad', 'network', 'ip', 'dhcp', 'dns', 'bond', 'vlan', 'bridge', 'static', 'gateway', 'route', 'mtu', 'notification', 'email', 'smtp', 'telegram', 'webhook', 'tuning', 'nfs threads', 'metrics', 'prometheus', 'telemetry', 'log level', 'theme', 'dark', 'light', 'appearance', 'custom.conf', 'package', 'systemd'])
 		]
 	}
 ];

@@ -18,6 +18,7 @@
 	import SmbPanel from './SmbPanel.svelte';
 	import IscsiPanel from './IscsiPanel.svelte';
 	import NvmeofPanel from './NvmeofPanel.svelte';
+	import RclonePanel from './RclonePanel.svelte';
 	import NfsWizardForm from './wizard/NfsWizardForm.svelte';
 	import SmbWizardForm from './wizard/SmbWizardForm.svelte';
 	import IscsiWizardForm from './wizard/IscsiWizardForm.svelte';
@@ -26,6 +27,8 @@
 	import SmbWizardReview from './wizard/SmbWizardReview.svelte';
 	import IscsiWizardReview from './wizard/IscsiWizardReview.svelte';
 	import NvmeofWizardReview from './wizard/NvmeofWizardReview.svelte';
+	import RcloneWizardForm from './wizard/RcloneWizardForm.svelte';
+	import RcloneWizardReview from './wizard/RcloneWizardReview.svelte';
 	import {
 		nfs,
 		nfsRefresh,
@@ -47,11 +50,17 @@
 		nvmeRefresh,
 		nvmeLoadProtocol,
 	} from '$lib/sharing/nvmeof.svelte';
-	import { domainRefresh } from '$lib/domain.svelte';
+	import {
+		ftp,
+		sftp,
+		s3,
+		rcloneRefresh,
+		rcloneLoadProtocol,
+	} from '$lib/sharing/rclone.svelte';
 
 	// Guest shares are public web links (managed in their own panel), a peer
 	// of the network protocols but with no create-wizard / protocol service.
-	type Tab = 'nfs' | 'smb' | 'iscsi' | 'nvmeof' | 'guest';
+	type Tab = 'nfs' | 'smb' | 'ftp' | 'sftp' | 's3' | 'iscsi' | 'nvmeof' | 'guest';
 	// The protocols that DO use the cross-protocol create wizard.
 	type ShareProto = Exclude<Tab, 'guest'>;
 
@@ -67,8 +76,8 @@
 	let shareSmbGuestOk = $state(false);
 	let shareSmbReadOnly = $state(false);
 	let shareSmbValidUsers: string[] = $state([]);
-	let shareSmbTimeMachine = $state(false);
-	let shareSmbTmMaxSize: number | null = $state(null);
+	let shareRcloneName = $state('');
+	let shareRcloneReadOnly = $state(false);
 	// SMB inline user/group creation moved into <SmbWizardForm>.
 	// iSCSI access
 	let shareIscsiName = $state('');
@@ -98,11 +107,15 @@
 
 	// Whether the currently-chosen protocol stores its data on a block
 	// subvolume (iSCSI, NVMe-oF) instead of a filesystem subvolume
-	// (NFS, SMB). Used by the source-picker, the inline-subvolume
+	// (NFS, SMB, FTP, SFTP, S3). Used by the source-picker, the inline-subvolume
 	// creator, and the suggested-quota copy. Single derived = no more
 	// inline `shareProtocol === 'iscsi' || shareProtocol === 'nvmeof'`
 	// expressions across the wizard.
 	const isBlock = $derived(shareProtocol === 'iscsi' || shareProtocol === 'nvmeof');
+
+	function sanitizeRcloneName(name: string): string {
+		return name.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^[^A-Za-z0-9]+/, '');
+	}
 
 	async function inlineCreateSubvolume() {
 		if (!inlineSvName || !inlineSvFs) return;
@@ -140,7 +153,7 @@
 		shareSubvolume = '';
 		shareNfsHost = ''; shareNfsOptions = 'rw,sync,no_subtree_check';
 		shareSmbName = ''; shareSmbGuestOk = false; shareSmbReadOnly = false; shareSmbValidUsers = [];
-		shareSmbTimeMachine = false; shareSmbTmMaxSize = null;
+		shareRcloneName = ''; shareRcloneReadOnly = false;
 		shareIscsiName = ''; shareNvmeofName = '';
 		shareNvmeofAddr = '0.0.0.0'; shareNvmeofPort = '4420';
 		showInlineCreate = false;
@@ -167,7 +180,7 @@
 	// API method + payload shape; createShare() just dispatches. This
 	// replaces a 4-way if/else cascade with a single registry lookup.
 	const protocolCreators: Record<
-		'nfs' | 'smb' | 'iscsi' | 'nvmeof',
+		ShareProto,
 		(sv: Subvolume) => Promise<unknown>
 	> = {
 		nfs: (sv) => withToast(
@@ -184,10 +197,33 @@
 				guest_ok: shareSmbGuestOk,
 				read_only: shareSmbReadOnly,
 				valid_users: shareSmbValidUsers,
-				time_machine: shareSmbTimeMachine,
-				time_machine_max_size_gib: shareSmbTmMaxSize ?? undefined,
+				time_machine: false,
 			}),
 			'SMB share created',
+		),
+		ftp: (sv) => withToast(
+			() => client.call('share.ftp.create', {
+				name: shareRcloneName || sanitizeRcloneName(sv.name),
+				path: sv.path,
+				read_only: shareRcloneReadOnly,
+			}),
+			'FTP share created',
+		),
+		sftp: (sv) => withToast(
+			() => client.call('share.sftp.create', {
+				name: shareRcloneName || sanitizeRcloneName(sv.name),
+				path: sv.path,
+				read_only: shareRcloneReadOnly,
+			}),
+			'SFTP share created',
+		),
+		s3: (sv) => withToast(
+			() => client.call('share.s3.create', {
+				name: shareRcloneName || sanitizeRcloneName(sv.name),
+				path: sv.path,
+				read_only: shareRcloneReadOnly,
+			}),
+			'S3 share created',
 		),
 		iscsi: (sv) => withToast(
 			() => client.call('share.iscsi.create', {
@@ -214,7 +250,7 @@
 		const ok = await protocolCreators[shareProtocol](sv);
 		if (ok !== undefined) {
 			shareWizardStep = 0;
-			nfsRefresh(); smbRefresh(); iscsiRefresh(); nvmeRefresh();
+			nfsRefresh(); smbRefresh(); rcloneRefresh('ftp'); rcloneRefresh('sftp'); rcloneRefresh('s3'); iscsiRefresh(); nvmeRefresh();
 		}
 	}
 
@@ -222,6 +258,9 @@
 	const TABS: { key: Tab; label: string; hash: string }[] = [
 		{ key: 'smb',    label: 'SMB',          hash: '#smb' },
 		{ key: 'nfs',    label: 'NFS',          hash: '#nfs' },
+		{ key: 'ftp',    label: 'FTP',          hash: '#ftp' },
+		{ key: 'sftp',   label: 'SFTP',         hash: '#sftp' },
+		{ key: 's3',     label: 'S3',           hash: '#s3' },
 		{ key: 'iscsi',  label: 'iSCSI',        hash: '#iscsi' },
 		{ key: 'nvmeof', label: 'NVMe-oF',      hash: '#nvmeof' },
 		{ key: 'guest',  label: 'Guest Shares', hash: '#guest' },
@@ -291,11 +330,17 @@
 		const p = params as { collection?: string };
 		if (p?.collection === 'share.nfs') nfsRefresh();
 		if (p?.collection === 'share.smb') smbRefresh();
+		if (p?.collection === 'share.ftp') rcloneRefresh('ftp');
+		if (p?.collection === 'share.sftp') rcloneRefresh('sftp');
+		if (p?.collection === 'share.s3') rcloneRefresh('s3');
 		if (p?.collection === 'share.iscsi') iscsiRefresh();
 		if (p?.collection === 'share.nvmeof') nvmeRefresh();
 		if (p?.collection === 'protocol') {
 			nfsLoadProtocol();
 			smbLoadProtocol();
+			rcloneLoadProtocol('ftp');
+			rcloneLoadProtocol('sftp');
+			rcloneLoadProtocol('s3');
 			iscsiLoadProtocol();
 			nvmeLoadProtocol();
 		}
@@ -309,19 +354,20 @@
 			}).catch(() => { isAdmin = false; }),
 			nfsRefresh().then(() => { nfs.loading = false; }),
 			smbRefresh().then(() => { smb.loading = false; }),
+			rcloneRefresh('ftp').then(() => { ftp.loading = false; }),
+			rcloneRefresh('sftp').then(() => { sftp.loading = false; }),
+			rcloneRefresh('s3').then(() => { s3.loading = false; }),
 			iscsiRefresh().then(() => { iscsi.loading = false; }),
 			nvmeRefresh().then(() => { nvme.loading = false; }),
 			nfsLoadProtocol(),
 			smbLoadProtocol(),
+			rcloneLoadProtocol('ftp'),
+			rcloneLoadProtocol('sftp'),
+			rcloneLoadProtocol('s3'),
 			iscsiLoadProtocol(),
 			nvmeLoadProtocol(),
 			rdmaLoad(),
 		]);
-		// Load AD membership so SmbPanel's domain-user picker appears when the
-		// box is joined — otherwise the picker only ever showed after visiting
-		// Settings (the only other place that calls domainRefresh). Fire-and-
-		// forget: domainRefresh swallows its own errors.
-		domainRefresh();
 	});
 
 	onDestroy(() => client.offEvent(handleEvent));
@@ -351,12 +397,15 @@
 
 			<!-- Step 1: Protocol -->
 			{#if shareWizardStep === 1}
-			{@const selectedProto = ({ nfs: nfs.protocol, smb: smb.protocol, iscsi: iscsi.protocol, nvmeof: nvme.protocol })[shareProtocol]}
+			{@const selectedProto = ({ nfs: nfs.protocol, smb: smb.protocol, ftp: ftp.protocol, sftp: sftp.protocol, s3: s3.protocol, iscsi: iscsi.protocol, nvmeof: nvme.protocol })[shareProtocol]}
 			<div class="mb-4">
 				<Label>Protocol</Label>
 				<select bind:value={shareProtocol} class="mt-1 h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm">
 					<option value="smb">SMB — Windows/Samba File Sharing</option>
 					<option value="nfs">NFS — Network File System</option>
+					<option value="ftp">FTP — File Transfer Protocol (rclone)</option>
+					<option value="sftp">SFTP — SSH File Transfer (rclone)</option>
+					<option value="s3">S3 — S3-compatible object API (rclone)</option>
 					<option value="iscsi">iSCSI — Block Storage over TCP</option>
 					<option value="nvmeof">NVMe-oF — NVMe over Fabrics (TCP)</option>
 				</select>
@@ -365,7 +414,7 @@
 				<div class="mb-4 flex items-center gap-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2.5">
 					<AlertTriangle size={16} class="shrink-0 text-amber-500" />
 					<span class="flex-1 text-sm">{selectedProto.display_name} service is not enabled.</span>
-					<Button size="xs" onclick={async () => { await toggleProtocol(shareProtocol === 'nvmeof' ? 'nvmeof' : shareProtocol, false); await ({ nfs: nfsLoadProtocol, smb: smbLoadProtocol, iscsi: iscsiLoadProtocol, nvmeof: nvmeLoadProtocol })[shareProtocol](); }}>
+					<Button size="xs" onclick={async () => { await toggleProtocol(shareProtocol === 'nvmeof' ? 'nvmeof' : shareProtocol, false); await ({ nfs: nfsLoadProtocol, smb: smbLoadProtocol, ftp: () => rcloneLoadProtocol('ftp'), sftp: () => rcloneLoadProtocol('sftp'), s3: () => rcloneLoadProtocol('s3'), iscsi: iscsiLoadProtocol, nvmeof: nvmeLoadProtocol })[shareProtocol](); }}>
 						Enable
 					</Button>
 				</div>
@@ -434,6 +483,9 @@
 					const sv = shareSubvolumes.find(s => s.path === shareSubvolume || s.block_device === shareSubvolume);
 					if (sv) {
 						if (shareProtocol === 'smb' && !shareSmbName) shareSmbName = sv.name;
+						if ((shareProtocol === 'ftp' || shareProtocol === 'sftp' || shareProtocol === 's3') && !shareRcloneName) {
+							shareRcloneName = sanitizeRcloneName(sv.name);
+						}
 						if (shareProtocol === 'iscsi' && !shareIscsiName) shareIscsiName = sv.name;
 						if (shareProtocol === 'nvmeof' && !shareNvmeofName) shareNvmeofName = sv.name;
 					}
@@ -454,8 +506,12 @@
 					bind:guestOk={shareSmbGuestOk}
 					bind:readOnly={shareSmbReadOnly}
 					bind:validUsers={shareSmbValidUsers}
-					bind:timeMachine={shareSmbTimeMachine}
-					bind:maxSizeGib={shareSmbTmMaxSize}
+				/>
+			{:else if shareProtocol === 'ftp' || shareProtocol === 'sftp' || shareProtocol === 's3'}
+				<RcloneWizardForm
+					kind={shareProtocol}
+					bind:name={shareRcloneName}
+					bind:readOnly={shareRcloneReadOnly}
 				/>
 			{:else if shareProtocol === 'iscsi'}
 				<IscsiWizardForm bind:name={shareIscsiName} />
@@ -488,8 +544,13 @@
 						guestOk={shareSmbGuestOk}
 						readOnly={shareSmbReadOnly}
 						validUsers={shareSmbValidUsers}
-						timeMachine={shareSmbTimeMachine}
-						maxSizeGib={shareSmbTmMaxSize}
+					/>
+				{:else if shareProtocol === 'ftp' || shareProtocol === 'sftp' || shareProtocol === 's3'}
+					<RcloneWizardReview
+						kind={shareProtocol}
+						name={shareRcloneName}
+						fallbackName={sv?.name ?? ''}
+						readOnly={shareRcloneReadOnly}
 					/>
 				{:else if shareProtocol === 'iscsi'}
 					<IscsiWizardReview name={shareIscsiName} fallbackName={sv?.name ?? ''} />
@@ -514,8 +575,8 @@
 <!-- Tab bar with inline status -->
 <div class="mb-6 flex items-center border-b border-border">
 	{#each TABS as tab}
-		{@const proto = ({ nfs: nfs.protocol, smb: smb.protocol, iscsi: iscsi.protocol, nvmeof: nvme.protocol, guest: undefined })[tab.key]}
-		{@const count = ({ nfs: nfs.shares.length, smb: smb.shares.length, iscsi: iscsi.targets.length, nvmeof: nvme.subsystems.length, guest: 0 })[tab.key]}
+		{@const proto = ({ nfs: nfs.protocol, smb: smb.protocol, ftp: ftp.protocol, sftp: sftp.protocol, s3: s3.protocol, iscsi: iscsi.protocol, nvmeof: nvme.protocol, guest: undefined })[tab.key]}
+		{@const count = ({ nfs: nfs.shares.length, smb: smb.shares.length, ftp: ftp.shares.length, sftp: sftp.shares.length, s3: s3.shares.length, iscsi: iscsi.targets.length, nvmeof: nvme.subsystems.length, guest: 0 })[tab.key]}
 		<button
 			onclick={() => switchTab(tab.key)}
 			class="flex items-center gap-2 px-4 py-2 text-sm font-medium transition-colors {activeTab === tab.key
@@ -551,6 +612,15 @@
 <!-- ════════════════════════════════════════════════════ SMB ════════════════════════════════════════════════════ -->
 {:else if activeTab === 'smb'}
 	<SmbPanel />
+
+{:else if activeTab === 'ftp'}
+	<RclonePanel kind="ftp" />
+
+{:else if activeTab === 'sftp'}
+	<RclonePanel kind="sftp" />
+
+{:else if activeTab === 's3'}
+	<RclonePanel kind="s3" />
 
 
 <!-- ════════════════════════════════════════════════════ iSCSI ════════════════════════════════════════════════════ -->

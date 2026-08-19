@@ -4,7 +4,7 @@
 
 Because bcachefs deserves a proper NAS appliance, and nobody was building one.
 
-bcachefs is arguably the most interesting Linux filesystem in years. But using it for NAS meant CLI-only. NASty wraps it in an appliance with a web UI, NFS/SMB/iSCSI/NVMe-oF sharing, a Kubernetes CSI driver, and NixOS for atomic updates.
+bcachefs is arguably the most interesting Linux filesystem in years. But using it for NAS meant CLI-only. Upstream NASty wraps it in an appliance with a web UI and NixOS. **This fork** ports that appliance to Debian Trixie (armhf / QNAP TS-228), with apt updates and snapper rollback, and is migrating storage/sharing toward btrfs + ksmbd.
 
 ## Why bcachefs instead of ZFS?
 
@@ -17,20 +17,17 @@ ZFS is battle-tested and great. I'm not here to trash it. But:
 
 The tradeoff: bcachefs is younger and less proven. I'm comfortable with that for a project that's explicitly exploring what's next.
 
-## Why NixOS?
+## Why Debian (this fork)?
 
-Because a NAS appliance should be a single atomic unit that you can update, roll back, and reproduce.
+Upstream NASty uses NixOS for atomic generations. This QNAP TS-228 port uses **Debian Trixie** because the RTD1195 is armv7 and the board already runs a Debian rootfs on btrfs.
 
-- **Atomic updates.** `nixos-rebuild switch` either succeeds completely or doesn't change anything. No "halfway upgraded" state.
-- **Rollback.** Every update creates a new generation. Boot into the previous one if something breaks.
-- **Reproducible.** The entire system is defined in code. Two machines with the same config are identical.
-- **No package manager conflicts.** Nix handles all dependencies in isolation. No `pacman -Syu` breaking your storage engine at 2am.
+- **apt upgrades** apply package updates through the WebUI or CLI.
+- **snapper** takes btrfs snapshots of `/` before/after apt so you can roll back.
+- Packages ship as `.deb` files (`nasty`, `nasty-engine`, `nasty-webui`).
 
-Traditional NAS distros (FreeNAS/TrueNAS, OpenMediaVault) use FreeBSD or Debian with mutable package management. NASty uses NixOS because a storage appliance should be the last thing that breaks during an update.
+## Can I add custom configuration?
 
-## Can I add my own NixOS configuration?
-
-Yes. Advanced users can drop settings the WebUI doesn't expose into `/etc/nixos/custom.nix` — extra NixOS options, packages, systemd units, whatever. NASty imports it automatically when present, and never writes or overwrites it: only the generated `flake.nix` is re-rendered on upgrade, so your `custom.nix` survives reboots *and* upgrades. Use `lib.mkForce` where you need to override a value a NASty module already sets; import order alone does not override equal-priority NixOS definitions. Apply changes with `nixos-rebuild switch --flake /etc/nixos#nasty`. A syntax or build error fails the rebuild safely — the running generation keeps working — so just fix it and rebuild.
+Yes. Drop notes or local overrides in `/etc/nasty/custom.conf`. NASty never overwrites that file. System packages and units are managed with apt/systemd as usual.
 
 ## Is this production-ready?
 
@@ -50,10 +47,13 @@ Use it for homelabs, development, and learning. Not for storing your only copy o
 
 - **NFS** — Network File System. Standard Linux/Unix file sharing.
 - **SMB** — Server Message Block. Windows/macOS file sharing over the network.
+- **FTP** — File Transfer Protocol via `rclone serve ftp`. Shares appear as top-level folders. One username/password for the protocol (optional anonymous login). Default port 21 plus a passive range.
+- **SFTP** — SSH File Transfer via `rclone serve sftp` on port 2022 (so it does not collide with the box SSH daemon). Encrypted; one username/password for the protocol.
+- **S3** — S3-compatible object API via `rclone serve s3`. Share names are path-style bucket names. One access key / secret key for the protocol. Default port 9000.
 - **iSCSI** — Internet SCSI. Block storage over TCP. Used by Kubernetes for persistent volumes.
 - **NVMe-oF** — NVMe over Fabrics. High-performance block storage over TCP. The modern alternative to iSCSI.
 
-All four protocols are managed through the same WebUI and API. The Kubernetes CSI driver supports all four.
+File and object protocols (NFS, SMB, FTP, SFTP, S3) plus the two block protocols are managed through the same WebUI and API. The Kubernetes CSI driver supports NFS, SMB, iSCSI, and NVMe-oF.
 
 ## How are snapshots and clones different from ZFS?
 

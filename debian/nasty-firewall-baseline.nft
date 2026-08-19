@@ -1,0 +1,16 @@
+destroy table inet nasty
+table inet nasty {
+  chain input {
+    type filter hook input priority 0; policy drop;
+    ct state established,related accept
+    ct state invalid drop
+    iif lo accept
+    ip protocol icmp accept
+    ip6 nexthdr icmpv6 accept
+    udp dport 546 accept
+  }
+  chain forward {
+    type filter hook forward priority -10; policy accept;
+    ct direction original ct status dnat drop
+  }
+}

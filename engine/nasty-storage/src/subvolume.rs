@@ -1449,6 +1449,21 @@ impl SubvolumeService {
     ) -> Result<Subvolume, SubvolumeError> {
         validate_subvolume_name(&req.name)?;
 
+        if req.foreground_target.is_some()
+            || req.background_target.is_some()
+            || req.promote_target.is_some()
+            || req.metadata_target.is_some()
+        {
+            return Err(SubvolumeError::CommandFailed(
+                "tiering targets are not supported on btrfs builds".into(),
+            ));
+        }
+        if req.data_replicas.is_some() {
+            return Err(SubvolumeError::CommandFailed(
+                "per-subvolume data_replicas is not supported on btrfs builds".into(),
+            ));
+        }
+
         if req.subvolume_type == SubvolumeType::Block && req.volsize_bytes.is_none() {
             return Err(SubvolumeError::VolsizeRequired);
         }
@@ -1548,7 +1563,7 @@ impl SubvolumeService {
             "Creating subvolume '{}' in filesystem '{}'",
             req.name, req.filesystem
         );
-        cmd::run_ok("bcachefs", &["subvolume", "create", &subvol_path])
+        cmd::run_ok("btrfs", &["subvolume", "create", &subvol_path])
             .await
             .map_err(SubvolumeError::CommandFailed)?;
 
@@ -1578,58 +1593,18 @@ impl SubvolumeService {
             )));
         }
 
-        // Set compression if specified
+        // Compression via btrfs property (inode attribute). Tiering /
+        // replicas / project quotas are not supported on this fork.
         if let Some(ref comp) = req.compression {
             info!("Setting compression={} on subvolume '{}'", comp, req.name);
+            let prop = if comp == "none" { "none" } else { comp.as_str() };
             let _ = cmd::run_ok(
-                "bcachefs",
-                &[
-                    "set-file-option",
-                    &format!("--compression={comp}"),
-                    &subvol_path,
-                ],
+                "btrfs",
+                &["property", "set", &subvol_path, "compression", prop],
             )
             .await;
         }
-
-        // Set tiering targets if specified
-        for (flag, value) in [
-            ("--foreground_target", &req.foreground_target),
-            ("--background_target", &req.background_target),
-            ("--promote_target", &req.promote_target),
-            ("--metadata_target", &req.metadata_target),
-        ] {
-            if let Some(t) = value {
-                info!("Setting {}={} on subvolume '{}'", flag, t, req.name);
-                let _ = cmd::run_ok(
-                    "bcachefs",
-                    &["set-file-option", &format!("{flag}={t}"), &subvol_path],
-                )
-                .await;
-            }
-        }
-
-        // Set data replicas if specified
-        if let Some(replicas) = req.data_replicas {
-            info!(
-                "Setting data_replicas={} on subvolume '{}'",
-                replicas, req.name
-            );
-            let _ = cmd::run_ok(
-                "bcachefs",
-                &[
-                    "set-file-option",
-                    &format!("--data_replicas={replicas}"),
-                    &subvol_path,
-                ],
-            )
-            .await;
-        }
-
-        // For filesystem subvolumes: always assign a project ID so usage
-        // tracking via repquota works regardless of whether the user set
-        // a hard limit. `0` is the quota-tools convention for "no limit"
-        // — repquota still reports usage, it just won't enforce.
+        // Project quotas: no-op on btrfs first-cut (see set_project_quota).
         if req.subvolume_type == SubvolumeType::Filesystem {
             let projid = project_id_for(&req.filesystem, &req.name);
             let limit = effective_volsize_bytes.unwrap_or(0);
@@ -1694,7 +1669,7 @@ impl SubvolumeService {
                     "Skipping nocow on {img_path} — filesystem is encrypted (nocow disables encryption)"
                 );
             } else {
-                match cmd::run_ok("bcachefs", &["set-file-option", "--nocow", &img_path]).await {
+                match cmd::run_ok("chattr", &["+C", &img_path]).await {
                     Ok(_) => info!("Set nocow on {img_path}"),
                     Err(e) => warn!("Failed to set nocow on {img_path}: {e}"),
                 }
@@ -1854,7 +1829,7 @@ impl SubvolumeService {
                 "Deleting child subvolume '{child}' before parent '{}'",
                 req.name
             );
-            if let Err(e) = cmd::run_ok("bcachefs", &["subvolume", "delete", &child_path]).await {
+            if let Err(e) = cmd::run_ok("btrfs", &["subvolume", "delete", &child_path]).await {
                 warn!("Failed to delete child subvolume '{child}': {e}");
                 stuck.push(format!("{child} ({e})"));
             }
@@ -1867,7 +1842,7 @@ impl SubvolumeService {
             "Deleting subvolume '{}' from filesystem '{}'",
             req.name, req.filesystem
         );
-        cmd::run_ok("bcachefs", &["subvolume", "delete", &subvol_path])
+        cmd::run_ok("btrfs", &["subvolume", "delete", &subvol_path])
             .await
             .map_err(SubvolumeError::CommandFailed)?;
 
@@ -2025,25 +2000,17 @@ impl SubvolumeService {
         let subvol = self.get(&req.filesystem, &req.name, owner_filter).await?;
         let path = &subvol.path;
 
-        if req.data_replicas.is_some() || req.erasure_code.is_some() {
-            let data_replicas = match req.data_replicas {
-                Some(0) => option_replicas(&subvol.bcachefs_inherited_options),
-                Some(replicas) => replicas,
-                None => {
-                    option_replicas_or(&subvol.bcachefs_options, &subvol.bcachefs_inherited_options)
-                }
-            };
-            let erasure_code = match req.erasure_code {
-                Some(SubvolumeErasureCode::Inherit) => {
-                    option_enabled(subvol.bcachefs_inherited_options.get("erasure_code"))
-                }
-                Some(SubvolumeErasureCode::Enabled) => true,
-                Some(SubvolumeErasureCode::Disabled) => false,
-                None => {
-                    option_enabled_or(&subvol.bcachefs_options, &subvol.bcachefs_inherited_options)
-                }
-            };
-            validate_storage_policy(data_replicas, erasure_code)?;
+        // Unsupported knobs rejected below; skip bcachefs storage-policy validation.
+        if req.foreground_target.is_some()
+            || req.background_target.is_some()
+            || req.promote_target.is_some()
+            || req.metadata_target.is_some()
+            || req.data_replicas.is_some()
+            || req.erasure_code.is_some()
+        {
+            return Err(SubvolumeError::CommandFailed(
+                "tiering targets, data_replicas, and erasure_code are not supported on btrfs builds".into(),
+            ));
         }
 
         if let Some(ref comp) = req.compression {
@@ -2053,12 +2020,8 @@ impl SubvolumeService {
                 comp_value, req.name
             );
             cmd::run_ok(
-                "bcachefs",
-                &[
-                    "set-file-option",
-                    &format!("--compression={comp_value}"),
-                    path,
-                ],
+                "btrfs",
+                &["property", "set", path, "compression", comp_value],
             )
             .await
             .map_err(SubvolumeError::CommandFailed)?;
@@ -2081,71 +2044,7 @@ impl SubvolumeService {
             }
         }
 
-        // Update tiering targets if specified (use "-" to remove)
-        for (flag, value) in [
-            ("--foreground_target", &req.foreground_target),
-            ("--background_target", &req.background_target),
-            ("--promote_target", &req.promote_target),
-            ("--metadata_target", &req.metadata_target),
-        ] {
-            if let Some(t) = value {
-                info!("Setting {}={} on subvolume '{}'", flag, t, req.name);
-                cmd::run_ok(
-                    "bcachefs",
-                    &["set-file-option", &format!("{flag}={t}"), path],
-                )
-                .await
-                .map_err(SubvolumeError::CommandFailed)?;
-            }
-        }
-
-        let previous_data_replicas = subvol
-            .bcachefs_overrides
-            .get("data_replicas")
-            .map(|replicas| format!("--data_replicas={replicas}"))
-            .unwrap_or_else(|| "--data_replicas=-".to_string());
-
-        // Update data replicas if specified (use 0 to inherit from the parent)
-        if let Some(replicas) = req.data_replicas {
-            info!(
-                "Setting data_replicas={} on subvolume '{}'",
-                replicas, req.name
-            );
-            let flag = if replicas == 0 {
-                "--data_replicas=-".to_string()
-            } else {
-                format!("--data_replicas={replicas}")
-            };
-            cmd::run_ok("bcachefs", &["set-file-option", &flag, path])
-                .await
-                .map_err(SubvolumeError::CommandFailed)?;
-        }
-
-        if let Some(erasure_code) = req.erasure_code {
-            info!(
-                "Setting erasure_code={:?} on subvolume '{}'",
-                erasure_code, req.name
-            );
-            if let Err(error) = cmd::run_ok(
-                "bcachefs",
-                &["set-file-option", erasure_code.file_option(), path],
-            )
-            .await
-            {
-                if req.data_replicas.is_some()
-                    && let Err(rollback_error) = cmd::run_ok(
-                        "bcachefs",
-                        &["set-file-option", &previous_data_replicas, path],
-                    )
-                    .await
-                {
-                    return Err(SubvolumeError::CommandFailed(format!(
-                        "{error}; restoring data replicas also failed: {rollback_error}"
-                    )));
-                }
-                return Err(SubvolumeError::CommandFailed(error));
-            }
-        }
+        // tiering / replicas / erasure_code rejected above
 
         self.get(&req.filesystem, &req.name, owner_filter).await
     }
@@ -2205,7 +2104,7 @@ impl SubvolumeService {
         );
         // Snapshots are always read-only; use snapshot.clone for writable copies
         cmd::run_ok(
-            "bcachefs",
+            "btrfs",
             &["subvolume", "snapshot", "-r", &source_path, &snap_path],
         )
         .await
@@ -2278,7 +2177,7 @@ impl SubvolumeService {
             "Deleting snapshot '{}' of subvolume '{}/{}'",
             req.name, req.filesystem, req.subvolume
         );
-        cmd::run_ok("bcachefs", &["subvolume", "delete", &snap_path])
+        cmd::run_ok("btrfs", &["subvolume", "delete", &snap_path])
             .await
             .map_err(SubvolumeError::CommandFailed)?;
 
@@ -2560,7 +2459,7 @@ impl SubvolumeService {
             "Rollback: deleting live subvolume '{}/{}' before recreating from @{}",
             req.filesystem, req.subvolume, req.snapshot
         );
-        cmd::run_ok("bcachefs", &["subvolume", "delete", &subvol_path])
+        cmd::run_ok("btrfs", &["subvolume", "delete", &subvol_path])
             .await
             .map_err(|e| {
                 SubvolumeError::CommandFailed(format!(
@@ -2654,7 +2553,7 @@ impl SubvolumeService {
         );
         // Writable snapshot = COW clone
         cmd::run_ok(
-            "bcachefs",
+            "btrfs",
             &["subvolume", "snapshot", &source_path, &new_subvol_path],
         )
         .await
@@ -2820,18 +2719,67 @@ async fn bcachefs_list_all(mount_point: &str) -> BcachefsInfo {
 }
 
 async fn bcachefs_list_all_strict(mount_point: &str) -> Result<BcachefsInfo, SubvolumeError> {
-    let output = cmd::run_ok(
-        "bcachefs",
-        &["subvolume", "list", "--snapshots", "--json", mount_point],
-    )
-    .await
-    .map_err(|error| SubvolumeError::CommandFailed(error.to_string()))?;
-    let entries: Vec<BcachefsListEntry> = serde_json::from_str(&output).map_err(|error| {
-        SubvolumeError::CommandFailed(format!(
-            "parse bcachefs subvolume list for {mount_point}: {error}"
-        ))
-    })?;
-    Ok(build_bcachefs_info(entries))
+    // Keep the historical helper name; implementation is btrfs.
+    // `btrfs subvolume list -a <mp>` emits: ID <id> gen <g> top level <t> path <path>
+    let output = cmd::run_ok("btrfs", &["subvolume", "list", "-a", mount_point])
+        .await
+        .map_err(|error| SubvolumeError::CommandFailed(error.to_string()))?;
+    Ok(parse_btrfs_subvolume_list(mount_point, &output))
+}
+
+fn parse_btrfs_subvolume_list(mount_point: &str, output: &str) -> BcachefsInfo {
+    let mut subvol_paths = std::collections::HashSet::new();
+    let mut subvolume_ids = std::collections::HashMap::new();
+    let mut snapshot_flags = std::collections::HashMap::new();
+    let mut snapshot_parents = std::collections::HashMap::new();
+    let snapshot_created_at = std::collections::HashMap::new();
+
+    let mount_prefix = mount_point.trim_end_matches('/');
+    for line in output.lines() {
+        let Some(path_idx) = line.find(" path ") else {
+            continue;
+        };
+        let mut path = line[path_idx + 6..].trim().to_string();
+        // Absolute paths sometimes include the mount point or a leading <FS_TREE>/.
+        if let Some(rest) = path.strip_prefix(mount_prefix) {
+            path = rest.trim_start_matches('/').to_string();
+        }
+        if let Some(rest) = path.strip_prefix("<FS_TREE>/") {
+            path = rest.to_string();
+        }
+        path = path.trim_start_matches('/').to_string();
+        if path.is_empty() || path.starts_with(".nasty/") {
+            continue;
+        }
+
+        let id = line
+            .split_whitespace()
+            .skip_while(|t| *t != "ID")
+            .nth(1)
+            .and_then(|s| s.parse::<u32>().ok());
+        if let Some(id) = id {
+            subvolume_ids.insert(path.clone(), id);
+        }
+
+        if let Some((parent, snap)) = path.rsplit_once('@') {
+            // NASty snapshot naming: subvol@snap (snap has no further @).
+            if !parent.is_empty() && !snap.is_empty() && !snap.contains('/') {
+                let parent = parent.to_string();
+                snapshot_flags.insert(path.clone(), true);
+                snapshot_parents.insert(path, parent);
+                continue;
+            }
+        }
+        subvol_paths.insert(path);
+    }
+
+    BcachefsInfo {
+        subvol_paths,
+        subvolume_ids,
+        snapshot_flags,
+        snapshot_parents,
+        snapshot_created_at,
+    }
 }
 
 #[cfg(test)]
@@ -2903,37 +2851,11 @@ fn project_id_needs_update(current: Option<u32>, expected: u32) -> bool {
 /// Best-effort: logs a warning on failure rather than returning an error, since
 /// quota enforcement requires the `prjquota` mount option. Volume creation must
 /// not fail if quota support is unavailable.
-async fn set_project_quota(mount_point: &str, dir_path: &str, projid: u32, bytes: u64) {
-    // Register the project name in /etc/projid so that standard quota tools
-    // (repquota, edquota) can display human-readable names.
-    let proj_name = format!("nasty-{projid}");
-    register_project(&proj_name, projid);
-
-    match current_project_id(dir_path) {
-        Ok(current) if !project_id_needs_update(current, projid) => {
-            info!("project {proj_name} (id={projid}) already set on {dir_path}");
-        }
-        Ok(_) => {
-            if let Err(e) = cmd::run_ok("setproject", &["-c", "-P", &proj_name, dir_path]).await {
-                warn!("setproject failed on {dir_path}: {e}");
-                return;
-            }
-            info!("set project {proj_name} (id={projid}) on {dir_path}");
-        }
-        Err(e) => {
-            // Reapplying an unchanged project ID can trip a bcachefs quota
-            // assertion. If we cannot prove the current value, do not risk
-            // issuing the mutating ioctl.
-            warn!("could not read project ID on {dir_path}; skipping setproject: {e}");
-            return;
-        }
-    }
-
-    match set_project_quota_limit(mount_point, projid, bytes).await {
-        Ok(_) => info!("set quota {bytes} bytes for project {proj_name} on {mount_point}"),
-        Err(e) => warn!("setquota failed for project {proj_name} on {mount_point}: {e}"),
-    }
+async fn set_project_quota(_mount_point: &str, _dir_path: &str, _projid: u32, _bytes: u64) {
+    // Project quotas are not used on the btrfs first-cut. Kept as a no-op so
+    // create/reconcile call sites compile without quota tooling.
 }
+
 
 #[cfg(target_os = "linux")]
 fn current_project_id(path: &str) -> std::io::Result<Option<u32>> {
@@ -2968,25 +2890,15 @@ fn current_project_id(_path: &str) -> std::io::Result<Option<u32>> {
 /// Apply a project quota limit, propagating failures to callers that need
 /// resize metadata to stay consistent with the live quota.
 async fn set_project_quota_limit(
-    mount_point: &str,
-    projid: u32,
-    bytes: u64,
+    _mount_point: &str,
+    _projid: u32,
+    _bytes: u64,
 ) -> Result<(), SubvolumeError> {
-    use std::os::unix::fs::MetadataExt;
-
-    let dev = tokio::fs::metadata(mount_point).await?.dev();
-    let device =
-        block_device_for_dev(std::path::Path::new("/sys/dev/block"), dev).ok_or_else(|| {
-            SubvolumeError::CommandFailed(format!(
-                "no block device found for {mount_point} (dev_t {dev})"
-            ))
-        })?;
-    write_project_quota_limit(&device, projid, quota_kib_from_bytes(bytes)).map_err(|e| {
-        SubvolumeError::CommandFailed(format!(
-            "quotactl failed for project nasty-{projid} on {mount_point} ({device}): {e}"
-        ))
-    })
+    Err(SubvolumeError::CommandFailed(
+        "project quotas / resize-via-quota are not supported on btrfs builds".into(),
+    ))
 }
+
 
 /// Write a `name:id` entry to /etc/projid if not already present.
 /// This allows standard quota tools to resolve project IDs to names.
@@ -3235,31 +3147,9 @@ fn read_project_quotas(_device: &str) -> std::io::Result<HashMap<u32, ProjectQuo
 /// Query project quota usage for all projects on a filesystem in one shot.
 /// Returns a map of project_id → (used, hard limit).
 /// Falls back to empty map if quota information is unavailable.
-async fn query_project_usages(mount_point: &str) -> HashMap<u32, ProjectQuotaInfo> {
-    use std::os::unix::fs::MetadataExt;
-
-    // The device quotactl needs is the one backing the mountpoint's
-    // st_dev — NOT the /proc/mounts source string (see
-    // read_project_quotas). /sys/dev/block maps dev_t → kernel name.
-    let dev = match tokio::fs::metadata(mount_point).await {
-        Ok(m) => m.dev(),
-        Err(e) => {
-            warn!("quota query: stat {mount_point} failed: {e}");
-            return HashMap::new();
-        }
-    };
-    let Some(device) = block_device_for_dev(std::path::Path::new("/sys/dev/block"), dev) else {
-        warn!("quota query: no block device found for {mount_point} (dev_t {dev})");
-        return HashMap::new();
-    };
-
-    match read_project_quotas(&device) {
-        Ok(usages) => usages,
-        Err(e) => {
-            warn!("quota query via quotactl failed on {mount_point} ({device}): {e}");
-            HashMap::new()
-        }
-    }
+async fn query_project_usages(_mount_point: &str) -> HashMap<u32, ProjectQuotaInfo> {
+    // Project quotas are disabled on the btrfs first-cut.
+    HashMap::new()
 }
 
 /// Build a map of canonical backing-file path → loop device name.
@@ -3314,11 +3204,11 @@ fn find_loop_device_from_map(
     losetup_map.get(&canonical_str).cloned()
 }
 
-/// Find all child subvolumes under a given parent path using `bcachefs subvolume list -R`.
+/// Find all child subvolumes under a given parent path using `btrfs subvolume list -o`.
 /// Returns paths relative to the mount point, sorted so deepest children come last
 /// (caller should reverse for depth-first deletion).
 async fn find_child_subvolumes(mount_point: &str, parent_name: &str) -> Vec<String> {
-    let output = match cmd::run_ok("bcachefs", &["subvolume", "list", "-R", mount_point]).await {
+    let output = match cmd::run_ok("btrfs", &["subvolume", "list", "-o", mount_point]).await {
         Ok(o) => o,
         Err(e) => {
             // Empty children list means the caller (subvolume delete
@@ -3326,7 +3216,7 @@ async fn find_child_subvolumes(mount_point: &str, parent_name: &str) -> Vec<Stri
             // removed first — the outer delete then fails with a
             // less actionable error. Surface the real cause here.
             warn!(
-                "bcachefs subvolume list -R {mount_point} failed: {e}; \
+                "btrfs subvolume list -o {mount_point} failed: {e}; \
                  children of {parent_name} will not be discovered"
             );
             return Vec::new();
@@ -3359,7 +3249,7 @@ async fn materialize_subvol_from_snapshot(
     dest_path: &str,
     owner_filter: Option<&str>,
 ) -> Result<(), SubvolumeError> {
-    cmd::run_ok("bcachefs", &["subvolume", "snapshot", snap_path, dest_path])
+    cmd::run_ok("btrfs", &["subvolume", "snapshot", snap_path, dest_path])
         .await
         .map_err(SubvolumeError::CommandFailed)?;
 

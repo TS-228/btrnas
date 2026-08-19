@@ -1,0 +1,37 @@
+[Unit]
+Description=NASty Metrics Collector
+Documentation=https://github.com/nasty-project/nasty
+After=network.target
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/nasty-metrics
+Restart=always
+RestartSec=5
+StateDirectory=nasty
+Environment=RUST_LOG=nasty_metrics=info
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+KeyringMode=private
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallArchitectures=native
+UMask=0077
+StartLimitIntervalSec=60
+StartLimitBurst=5
+# smartctl / lsblk need device nodes
+PrivateDevices=false
+
+[Install]
+WantedBy=multi-user.target

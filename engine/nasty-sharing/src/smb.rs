@@ -10,12 +10,10 @@ use thiserror::Error;
 use tracing::info;
 use uuid::Uuid;
 
-const NASTY_SMB_CONF_PATH: &str = "/etc/samba/smb.nasty.conf";
-const NASTY_SMB_SHARE_DIR: &str = "/etc/samba/nasty.d";
+const KSMBD_CONF_PATH: &str = "/etc/ksmbd/ksmbd.conf";
 const STATE_DIR: &str = "/var/lib/nasty/shares/smb";
-/// Engine-written Avahi service file advertising `_adisk._tcp` so Time
-/// Machine shares appear in the macOS picker. Avahi auto-reloads this dir.
-const NASTY_TIMEMACHINE_AVAHI_PATH: &str = "/etc/avahi/services/nasty-timemachine.service";
+/// Usernames we registered in ksmbdpwd.db (ksmbd has no list CLI).
+const KSMBD_USERS_STATE: &str = "/var/lib/nasty/shares/ksmbd-users.json";
 
 #[derive(Debug, Error)]
 pub enum SmbError {
@@ -29,9 +27,9 @@ pub enum SmbError {
     PathNotInFilesystem(String),
     #[error("invalid share name: {0}")]
     InvalidName(String),
-    #[error("a Time Machine share must be authenticated and writable (not guest, not read-only)")]
-    TimeMachineRequiresAuth,
-    #[error("samba reload failed: {0}")]
+    #[error("Time Machine shares are not supported with ksmbd")]
+    TimeMachineUnsupported,
+    #[error("ksmbd reload failed: {0}")]
     ReloadFailed(String),
     #[error("principal lookup failed: {0}")]
     PrincipalLookup(String),
@@ -43,7 +41,7 @@ pub enum SmbError {
 pub struct SmbShare {
     /// Unique share identifier (UUID).
     pub id: String,
-    /// Samba share name used in `\\server\name` UNC paths.
+    /// SMB share name used in `\\server\name` UNC paths.
     pub name: String,
     /// Absolute filesystem path being shared (must be under `/fs/`).
     pub path: String,
@@ -57,11 +55,10 @@ pub struct SmbShare {
     pub guest_ok: bool,
     /// Usernames allowed to connect (empty means no restriction beyond authentication).
     pub valid_users: Vec<String>,
-    /// Additional raw Samba parameters written to the share section.
+    /// Additional raw ksmbd share parameters written to the share section.
     pub extra_params: HashMap<String, String>,
-    /// Whether this share is a macOS Time Machine destination. When true the
-    /// share section gets the `vfs_fruit` Time Machine options. Requires an
-    /// authenticated, writable share (not guest, not read-only).
+    /// Legacy Time Machine flag. Always rejected on create/update — ksmbd
+    /// has no vfs_fruit / Time Machine support.
     #[serde(default)]
     pub time_machine: bool,
     /// Optional Time Machine size cap in GiB, written as
@@ -69,7 +66,7 @@ pub struct SmbShare {
     /// backups. `None` = no advertised cap (pair with a subvolume quota).
     #[serde(default)]
     pub time_machine_max_size_gib: Option<u32>,
-    /// Whether the share is active in `smb.nasty.conf`.
+    /// Whether the share is active in `ksmbd.conf`.
     pub enabled: bool,
 }
 
@@ -81,7 +78,7 @@ impl HasId for SmbShare {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct CreateSmbShareRequest {
-    /// Samba share name (1–80 characters, no special characters).
+    /// SMB share name (1–80 characters, no special characters).
     pub name: String,
     /// Absolute path to share (must exist and be under `/fs/`).
     pub path: String,
@@ -95,7 +92,7 @@ pub struct CreateSmbShareRequest {
     pub guest_ok: Option<bool>,
     /// Allowed usernames; empty means no per-user restriction.
     pub valid_users: Option<Vec<String>>,
-    /// Additional raw Samba parameters for this share section.
+    /// Additional raw ksmbd parameters for this share section.
     pub extra_params: Option<HashMap<String, String>>,
     /// Make this a macOS Time Machine destination (default: false). Requires
     /// an authenticated, writable share.
@@ -122,7 +119,7 @@ pub struct UpdateSmbShareRequest {
     pub guest_ok: Option<bool>,
     /// Replacement allowed-users list (optional).
     pub valid_users: Option<Vec<String>>,
-    /// Replacement extra Samba parameters (optional).
+    /// Replacement extra ksmbd parameters (optional).
     pub extra_params: Option<HashMap<String, String>>,
     /// Toggle Time Machine destination (optional).
     pub time_machine: Option<bool>,
@@ -161,20 +158,10 @@ impl SmbService {
         Self
     }
 
-    /// Ensure `/etc/samba/smb.nasty.conf` holds the current include chain,
-    /// rebuilding it from the per-share configs on disk.
-    ///
-    /// tmpfiles creates that file *empty*, and until this branch the only
-    /// writer was a share create/update/delete. A box that joins a domain
-    /// before ever mutating a share therefore had no `include =
-    /// /etc/samba/nasty-domain.conf` in effect, so `net ads join`/winbindd
-    /// never saw the ADS globals — AD join was dead on arrival on fresh
-    /// installs and stayed dead on every upgraded box until the first share
-    /// mutation. Calling this at boot guarantees the chain exists before any
-    /// join runs. The rebuild is idempotent and cheap (a directory scan plus
-    /// one file write), so it is safe to run unconditionally on every boot.
+    /// Ensure `/etc/ksmbd/ksmbd.conf` exists with globals + enabled shares.
+    /// Idempotent; safe to run on every boot before starting ksmbd.
     pub async fn ensure_config_scaffolding(&self) -> Result<(), SmbError> {
-        rebuild_include_list().await
+        rewrite_ksmbd_conf().await
     }
 
     pub async fn list(&self) -> Result<Vec<SmbShare>, SmbError> {
@@ -250,13 +237,11 @@ impl SmbService {
             time_machine_max_size_gib: req.time_machine_max_size_gib.filter(|&n| n > 0),
             enabled: req.enabled.unwrap_or(true),
         };
-        validate_time_machine(&share)?;
+        reject_time_machine(&share)?;
 
         state_dir().save(&share.id, &share).await?;
-        write_share_conf(&share).await?;
-        rebuild_include_list().await?;
-        reload_samba().await?;
-        sync_timemachine_avahi().await;
+        rewrite_ksmbd_conf().await?;
+        reload_ksmbd().await?;
         wait_for_share_ready(&share.name).await;
 
         info!("Created SMB share '{}' at {}", share.name, share.path);
@@ -313,13 +298,11 @@ impl SmbService {
         if let Some(enabled) = req.enabled {
             share.enabled = enabled;
         }
-        validate_time_machine(&share)?;
+        reject_time_machine(&share)?;
 
         state_dir().save(&share.id, &share).await?;
-        write_share_conf(&share).await?;
-        rebuild_include_list().await?;
-        reload_samba().await?;
-        sync_timemachine_avahi().await;
+        rewrite_ksmbd_conf().await?;
+        reload_ksmbd().await?;
 
         info!("Updated SMB share '{}'", share.name);
         Ok(share)
@@ -332,20 +315,18 @@ impl SmbService {
             .ok_or_else(|| SmbError::NotFound(req.id.clone()))?;
 
         state_dir().remove(&req.id).await?;
-        remove_share_conf(&req.id).await;
-        rebuild_include_list().await?;
-        reload_samba().await?;
-        sync_timemachine_avahi().await;
+        rewrite_ksmbd_conf().await?;
+        reload_ksmbd().await?;
 
         info!("Deleted SMB share '{}'", req.id);
         Ok(())
     }
 }
 
-/// Pure portal policy. Samba principal names are ASCII case-insensitive, but
+/// Pure portal policy. SMB principal names are ASCII case-insensitive, but
 /// matches remain exact so similarly named users and groups cannot collide.
 pub fn share_allows_principal(share: &SmbShare, principal: &str, groups: &[String]) -> bool {
-    // Raw directives are evaluated by Samba and can override path, valid
+    // Raw directives are evaluated by ksmbd and can override path, valid
     // users, invalid users, and access semantics. The portal cannot safely
     // reproduce that effective policy, so any such share is portal-ineligible.
     if !share.enabled
@@ -440,16 +421,18 @@ async fn resolve_principal_authorization(
         groups.push(name.to_string());
     }
 
-    // Local portal principals must exist in both NSS and Samba's current
-    // passdb. Domain principals remain governed by the NSS/winbind lookup
-    // above because they are not local passdb entries.
-    if !principal.contains('\\') {
-        let output = run_bounded_command("pdbedit", &["--list", "--user", principal]).await?;
-        if !output.status.success() || !local_passdb_contains_principal(principal, &output.stdout) {
-            return Err(SmbError::PrincipalLookup(
-                "local principal is not present in Samba passdb".to_string(),
-            ));
-        }
+    // Local portal principals must exist in both NSS and ksmbdpwd.db.
+    // Domain principals are not supported with ksmbd on this fork.
+    if principal.contains('\\') {
+        return Err(SmbError::PrincipalLookup(
+            "domain principals are not supported with ksmbd".to_string(),
+        ));
+    }
+    let users = load_ksmbd_user_names().await?;
+    if !users.iter().any(|u| u.eq_ignore_ascii_case(principal)) {
+        return Err(SmbError::PrincipalLookup(
+            "local principal is not present in ksmbd user database".to_string(),
+        ));
     }
 
     Ok(PrincipalAuthorization {
@@ -458,14 +441,23 @@ async fn resolve_principal_authorization(
     })
 }
 
-fn local_passdb_contains_principal(principal: &str, output: &[u8]) -> bool {
-    let Ok(output) = std::str::from_utf8(output) else {
-        return false;
-    };
-    output.lines().any(|line| {
-        line.split_once(':')
-            .is_some_and(|(name, _)| name.eq_ignore_ascii_case(principal))
-    })
+async fn load_ksmbd_user_names() -> Result<Vec<String>, SmbError> {
+    match tokio::fs::read_to_string(KSMBD_USERS_STATE).await {
+        Ok(raw) => serde_json::from_str(&raw)
+            .map_err(|e| SmbError::ReloadFailed(format!("parse {KSMBD_USERS_STATE}: {e}"))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(SmbError::Io(e)),
+    }
+}
+
+async fn save_ksmbd_user_names(users: &[String]) -> Result<(), SmbError> {
+    if let Some(parent) = Path::new(KSMBD_USERS_STATE).parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let raw = serde_json::to_string_pretty(users)
+        .map_err(|e| SmbError::ReloadFailed(format!("serialize ksmbd users: {e}")))?;
+    tokio::fs::write(KSMBD_USERS_STATE, raw).await?;
+    Ok(())
 }
 
 async fn run_bounded_command(program: &str, args: &[&str]) -> Result<BoundedOutput, SmbError> {
@@ -531,7 +523,7 @@ async fn run_bounded_command(program: &str, args: &[&str]) -> Result<BoundedOutp
         .map_err(|_| SmbError::PrincipalLookup(format!("{program} timed out")))?
 }
 
-/// Strip characters that could inject new Samba config directives.
+/// Strip characters that could inject new ksmbd.conf directives.
 /// Removes newlines, carriage returns, semicolons, and other control characters.
 fn sanitize_smb_value(s: &str) -> String {
     s.chars()
@@ -640,6 +632,13 @@ fn validate_valid_users(entries: &[String]) -> Result<(), SmbError> {
     Ok(())
 }
 
+/// Optional SMB tuning knobs merged into `[global]` (from TuningService).
+#[derive(Debug, Clone, Default)]
+pub struct SmbTuningGlobals {
+    pub max_connections: u32,
+    pub deadtime: u32,
+}
+
 /// Render a single share config section. Pure: no I/O.
 fn render_share_conf(share: &SmbShare) -> String {
     let mut conf = format!("[{}]\n", sanitize_smb_value(&share.name));
@@ -668,9 +667,6 @@ fn render_share_conf(share: &SmbShare) -> String {
         conf.push_str("    create mask = 0666\n");
         conf.push_str("    directory mask = 0777\n");
     } else if !share.valid_users.is_empty() {
-        // Authenticated share: force operations as the first valid user
-        // so writes use that identity regardless of the connecting user.
-        // Skip @group entries — they're not user accounts.
         if let Some(first_user) = share.valid_users.iter().find(|u| !u.starts_with('@')) {
             conf.push_str(&format!(
                 "    force user = {}\n",
@@ -682,14 +678,6 @@ fn render_share_conf(share: &SmbShare) -> String {
     }
 
     if !share.valid_users.is_empty() {
-        // smb.conf list parameters split on whitespace, so an unquoted
-        // entry containing a space (e.g. an AD group like `CORP\domain
-        // admins`) would be parsed as two separate tokens. Quote any
-        // entry with a space to preserve its boundary. This is safe from
-        // quote-injection because validate_valid_users already rejects
-        // '"' in entries at the API boundary, and sanitize_smb_value
-        // doesn't strip '"' — so a validated entry can't smuggle its own
-        // closing quote.
         let sanitized_users: Vec<String> = share
             .valid_users
             .iter()
@@ -718,219 +706,93 @@ fn render_share_conf(share: &SmbShare) -> String {
         ));
     }
 
-    // Time Machine block last so it can't be silently overridden by an
-    // extra_params entry. The recommended vfs_fruit options for a macOS
-    // Time Machine destination over SMB (streams_xattr is backed by bcachefs
-    // xattrs).
-    if share.time_machine {
-        conf.push_str("    vfs objects = catia fruit streams_xattr\n");
-        conf.push_str("    fruit:time machine = yes\n");
-        conf.push_str("    fruit:metadata = stream\n");
-        conf.push_str("    fruit:posix_rename = yes\n");
-        conf.push_str("    fruit:veto_appledouble = no\n");
-        conf.push_str("    fruit:wipe_intentionally_left_blank_rfork = yes\n");
-        conf.push_str("    fruit:delete_empty_adfiles = yes\n");
-        if let Some(gib) = share.time_machine_max_size_gib {
-            conf.push_str(&format!("    fruit:time machine max size = {gib}G\n"));
-        }
-    }
-
     conf
 }
 
-/// A Time Machine share must be authenticated and writable — guest access or
-/// read-only would make it unusable as a backup target.
-fn validate_time_machine(share: &SmbShare) -> Result<(), SmbError> {
-    if share.time_machine && (share.guest_ok || share.read_only) {
-        return Err(SmbError::TimeMachineRequiresAuth);
+fn reject_time_machine(share: &SmbShare) -> Result<(), SmbError> {
+    if share.time_machine || share.time_machine_max_size_gib.is_some() {
+        return Err(SmbError::TimeMachineUnsupported);
     }
     Ok(())
 }
 
-/// Write a single share config file: /etc/samba/nasty.d/{id}.conf
-async fn write_share_conf(share: &SmbShare) -> Result<(), SmbError> {
-    tokio::fs::create_dir_all(NASTY_SMB_SHARE_DIR).await?;
-
-    let path = share_conf_path(&share.id);
-
-    if !share.enabled {
-        let _ = tokio::fs::remove_file(&path).await;
-        return Ok(());
-    }
-
-    let conf = render_share_conf(share);
-    tokio::fs::write(&path, &conf).await?;
-
-    // Make the directory writable by any authenticated user.
-    // Samba handles access control through its own authentication layer
-    // (valid_users, guest ok, etc.) — filesystem permissions should be permissive.
-    // Using chown with usernames fails when the user only exists in Samba's
-    // database (pdbedit) but not as a UNIX system user.
-    nasty_common::cmd::try_run("chmod", &["0777", &share.path]).await;
-
-    Ok(())
-}
-
-/// Remove the config file for a share.
-async fn remove_share_conf(id: &str) {
-    let path = share_conf_path(id);
-    if let Err(e) = tokio::fs::remove_file(&path).await
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        tracing::warn!("Failed to remove share conf {path}: {e}");
-    }
-}
-
-/// Rebuild smb.nasty.conf as a list of includes from per-share files.
-/// Also includes the engine-managed tuning config — this must be an `include`
-/// directive here rather than a `config file` in smb.conf, because Samba's
-/// `config file` replaces the entire config and prevents subsequent directives
-/// (like share includes) from being processed.
-async fn rebuild_include_list() -> Result<(), SmbError> {
-    tokio::fs::create_dir_all(NASTY_SMB_SHARE_DIR).await?;
-
-    let mut share_conf_names = Vec::new();
-    let mut dir = tokio::fs::read_dir(NASTY_SMB_SHARE_DIR).await?;
-    while let Ok(Some(entry)) = dir.next_entry().await {
-        let name = entry.file_name();
-        let name = name.to_string_lossy().into_owned();
-        if name.ends_with(".conf") {
-            share_conf_names.push(name);
-        }
-    }
-
-    let includes = render_include_list(&share_conf_names);
-    tokio::fs::write(NASTY_SMB_CONF_PATH, &includes).await?;
-    Ok(())
-}
-
-/// Build the contents of `smb.nasty.conf`: header comment, engine-managed
-/// global includes (domain, tuning), then one `include =` line per per-share
-/// config file name. Pure so it's testable without a filesystem.
-fn render_include_list(share_conf_names: &[String]) -> String {
-    let mut includes = String::from("# Managed by NASty — do not edit manually\n");
-    includes.push_str("# Per-share configs in /etc/samba/nasty.d/\n\n");
-
-    // Domain (AD member) global parameters. The file exists on every box
-    // (tmpfiles) and is empty until a join renders the ADS block into it,
-    // so unjoined boxes get byte-identical effective config.
-    includes.push_str("include = /etc/samba/nasty-domain.conf\n\n");
-
-    // Include engine-managed performance tuning (thread counts, timeouts, etc)
-    includes.push_str("include = /etc/samba/nasty-tuning.conf\n\n");
-
-    for name in share_conf_names {
-        includes.push_str(&format!("include = {NASTY_SMB_SHARE_DIR}/{name}\n"));
-    }
-
-    includes
-}
-
-/// Path to the per-share SMB config file.
-fn share_conf_path(id: &str) -> String {
-    format!("{NASTY_SMB_SHARE_DIR}/{id}.conf")
-}
-
-/// Build the `_adisk._tcp` Avahi service-group XML for the given Time Machine
-/// share names, or `None` when there are none (caller removes the file).
-///
-/// Each share becomes a `dkN=adVN=<name>,adVF=0x82` TXT record — that's how
-/// macOS Time Machine discovers selectable destinations; `adVF=0x82` flags
-/// the disk as Time Machine capable. The companion `sys=…adVF=0x100` record
-/// advertises the host's overall Time Machine support.
-fn build_timemachine_avahi_xml(tm_share_names: &[String]) -> Option<String> {
-    if tm_share_names.is_empty() {
-        return None;
-    }
-    let mut dk = String::new();
-    for (i, name) in tm_share_names.iter().enumerate() {
-        // Share names are already validated to a safe character set, but
-        // escape XML metacharacters defensively.
-        let safe = xml_escape(name);
-        dk.push_str(&format!(
-            "    <txt-record>dk{i}=adVN={safe},adVF=0x82</txt-record>\n"
+/// Build full ksmbd.conf contents: `[global]` + enabled share sections.
+fn render_ksmbd_conf(shares: &[SmbShare], tuning: &SmbTuningGlobals) -> String {
+    let mut conf = String::from("# Managed by NASty — do not edit manually\n\n");
+    conf.push_str("[global]\n");
+    conf.push_str("    workgroup = WORKGROUP\n");
+    conf.push_str("    server string = NASty\n");
+    conf.push_str("    map to guest = bad user\n");
+    conf.push_str("    guest account = nobody\n");
+    if tuning.max_connections > 0 {
+        conf.push_str(&format!(
+            "    max connections = {}\n",
+            tuning.max_connections
         ));
     }
-    Some(format!(
-        "<?xml version=\"1.0\" standalone='no'?>\n\
-         <!DOCTYPE service-group SYSTEM \"avahi-service.dtd\">\n\
-         <!-- Managed by NASty — do not edit manually -->\n\
-         <service-group>\n\
-         \x20 <name replace-wildcards=\"yes\">%h</name>\n\
-         \x20 <service>\n\
-         \x20\x20\x20 <type>_adisk._tcp</type>\n\
-         \x20\x20\x20 <port>9</port>\n\
-         \x20\x20\x20 <txt-record>sys=waMa=0,adVF=0x100</txt-record>\n\
-         {dk}\
-         \x20 </service>\n\
-         </service-group>\n"
-    ))
-}
-
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
-/// Recompute the `_adisk` advertisement from current state: write the Avahi
-/// service file listing every enabled Time Machine share, or remove it when
-/// there are none. Best-effort — discovery is a convenience, not correctness,
-/// so failures are logged, not propagated.
-async fn sync_timemachine_avahi() {
-    let shares: Vec<SmbShare> = state_dir().load_all().await;
-    let names: Vec<String> = shares
-        .into_iter()
-        .filter(|s| s.enabled && s.time_machine)
-        .map(|s| s.name)
-        .collect();
-
-    match build_timemachine_avahi_xml(&names) {
-        Some(xml) => {
-            if let Some(parent) = Path::new(NASTY_TIMEMACHINE_AVAHI_PATH).parent()
-                && let Err(e) = tokio::fs::create_dir_all(parent).await
-            {
-                tracing::warn!("Time Machine: could not ensure {}: {e}", parent.display());
-                return;
-            }
-            if let Err(e) = tokio::fs::write(NASTY_TIMEMACHINE_AVAHI_PATH, &xml).await {
-                tracing::warn!("Time Machine: could not write Avahi service file: {e}");
-                return;
-            }
-        }
-        None => {
-            if let Err(e) = tokio::fs::remove_file(NASTY_TIMEMACHINE_AVAHI_PATH).await
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                tracing::warn!("Time Machine: could not remove Avahi service file: {e}");
-            }
-        }
+    if tuning.deadtime > 0 {
+        conf.push_str(&format!("    deadtime = {}\n", tuning.deadtime));
     }
+    conf.push('\n');
 
-    // Avahi auto-reloads /etc/avahi/services via inotify; nudge it as a
-    // best-effort fallback (no-op if avahi isn't running).
-    let _ = tokio::process::Command::new("systemctl")
-        .args(["reload", "avahi-daemon"])
-        .output()
-        .await;
+    let mut enabled: Vec<&SmbShare> = shares.iter().filter(|s| s.enabled).collect();
+    enabled.sort_by_key(|s| s.name.to_ascii_lowercase());
+    for share in enabled {
+        conf.push_str(&render_share_conf(share));
+        conf.push('\n');
+    }
+    conf
 }
 
-/// Wait for an SMB share to be visible after smbcontrol reload.
-/// Uses `testparm` to verify the share is in the loaded config — this works
-/// for all shares regardless of authentication settings (unlike smbclient -L
-/// which requires guest access to list shares).
+fn load_tuning_globals_sync() -> SmbTuningGlobals {
+    // Best-effort read of tuning.json so share rewrites pick up SMB knobs
+    // without a circular crate dependency on nasty-system.
+    let Ok(raw) = std::fs::read_to_string("/var/lib/nasty/tuning.json") else {
+        return SmbTuningGlobals::default();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return SmbTuningGlobals::default();
+    };
+    SmbTuningGlobals {
+        max_connections: v
+            .get("smb_max_connections")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0) as u32,
+        deadtime: v.get("smb_deadtime").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
+    }
+}
+
+async fn rewrite_ksmbd_conf() -> Result<(), SmbError> {
+    if let Some(parent) = Path::new(KSMBD_CONF_PATH).parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let shares: Vec<SmbShare> = state_dir().load_all().await;
+    let tuning = load_tuning_globals_sync();
+    let conf = render_ksmbd_conf(&shares, &tuning);
+    tokio::fs::write(KSMBD_CONF_PATH, &conf).await?;
+
+    for share in shares.iter().filter(|s| s.enabled) {
+        // ksmbd maps to UNIX users; keep share trees world-writable so
+        // ACL is enforced by valid_users / guest ok rather than mode bits.
+        nasty_common::cmd::try_run("chmod", &["0777", &share.path]).await;
+    }
+    Ok(())
+}
+
+/// Wait for an SMB share to appear in `ksmbd.control --list` after reload.
 async fn wait_for_share_ready(share_name: &str) {
     for attempt in 1..=10 {
-        let output = tokio::process::Command::new("testparm")
-            .args(["-s", "--section-name", share_name])
+        let output = tokio::process::Command::new("ksmbd.control")
+            .args(["--list"])
             .stderr(std::process::Stdio::null())
             .output()
             .await;
         if let Ok(out) = output {
             let stdout = String::from_utf8_lossy(&out.stdout);
-            if stdout.contains(share_name) {
+            if stdout
+                .lines()
+                .any(|l| l.trim().eq_ignore_ascii_case(share_name))
+            {
                 info!("SMB share '{share_name}' is ready (attempt {attempt})");
                 return;
             }
@@ -940,18 +802,26 @@ async fn wait_for_share_ready(share_name: &str) {
     tracing::warn!("SMB share '{share_name}' readiness check timed out — proceeding anyway");
 }
 
-async fn reload_samba() -> Result<(), SmbError> {
-    let output = tokio::process::Command::new("smbcontrol")
-        .args(["all", "reload-config"])
+async fn reload_ksmbd() -> Result<(), SmbError> {
+    let output = tokio::process::Command::new("ksmbd.control")
+        .args(["--reload"])
         .output()
         .await?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        // Not running yet is fine — next start picks up the file.
+        if stderr.contains("No such process")
+            || stderr.contains("not running")
+            || stderr.to_ascii_lowercase().contains("no ksmbd")
+        {
+            info!("ksmbd not running; conf written for next start");
+            return Ok(());
+        }
         return Err(SmbError::ReloadFailed(stderr.to_string()));
     }
 
-    info!("Samba configuration reloaded");
+    info!("ksmbd configuration reloaded");
     Ok(())
 }
 
@@ -977,7 +847,7 @@ pub struct CreateSmbUserRequest {
 }
 
 impl SmbService {
-    /// Create a Linux system user and set their Samba password.
+    /// Create a Linux system user and register them in ksmbdpwd.db.
     pub async fn create_user(&self, req: CreateSmbUserRequest) -> Result<SmbUser, SmbError> {
         let username = req.username.trim();
         if username.is_empty() || username.len() > 32 {
@@ -1026,8 +896,20 @@ impl SmbService {
             return Err(SmbError::ReloadFailed(format!("useradd failed: {stderr}")));
         }
 
-        // Set Samba password
-        set_smb_password(username, &req.password).await?;
+        if let Err(e) = set_ksmbd_password(username, &req.password, /*add*/ true).await {
+            let _ = tokio::process::Command::new("userdel")
+                .arg(username)
+                .output()
+                .await;
+            return Err(e);
+        }
+
+        let mut users = load_ksmbd_user_names().await?;
+        if !users.iter().any(|u| u == username) {
+            users.push(username.to_string());
+            users.sort();
+            save_ksmbd_user_names(&users).await?;
+        }
 
         info!("Created SMB user '{username}' (UID {uid})");
         Ok(SmbUser {
@@ -1036,11 +918,16 @@ impl SmbService {
         })
     }
 
-    /// Delete a Linux system user and remove their Samba password.
+    /// Delete a Linux system user and remove them from ksmbdpwd.db.
     pub async fn delete_user(&self, username: &str) -> Result<(), SmbError> {
-        // Remove Samba password. `try_run` logs failures so a stale
-        // pdbedit entry that survives a "delete user" is debuggable.
-        nasty_common::cmd::try_run("smbpasswd", &["-x", username]).await;
+        nasty_common::cmd::try_run("ksmbd.adduser", &["--delete", username]).await;
+
+        let mut users = load_ksmbd_user_names().await.unwrap_or_default();
+        let before = users.len();
+        users.retain(|u| !u.eq_ignore_ascii_case(username));
+        if users.len() != before {
+            let _ = save_ksmbd_user_names(&users).await;
+        }
 
         // Delete system user
         let output = tokio::process::Command::new("userdel")
@@ -1059,33 +946,29 @@ impl SmbService {
 
     /// Change an SMB user's password.
     pub async fn set_user_password(&self, username: &str, password: &str) -> Result<(), SmbError> {
-        set_smb_password(username, password).await?;
+        set_ksmbd_password(username, password, /*add*/ false).await?;
         info!("Changed password for SMB user '{username}'");
         Ok(())
     }
 
-    /// List SMB users (system users with UID >= SMB_USER_UID_MIN and in Samba's database).
+    /// List SMB users registered in the engine's ksmbd user state.
     pub async fn list_users(&self) -> Result<Vec<SmbUser>, SmbError> {
-        // List users from smbpasswd database
-        let output = tokio::process::Command::new("pdbedit")
-            .args(["-L", "-d", "0"])
-            .output()
-            .await
-            .map_err(|e| SmbError::ReloadFailed(format!("pdbedit: {e}")))?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let names = load_ksmbd_user_names().await?;
         let mut users = Vec::new();
-        for line in stdout.lines() {
-            // pdbedit -L format: "username:uid:full name"
-            let parts: Vec<&str> = line.splitn(3, ':').collect();
-            if parts.len() >= 2
-                && let Ok(uid) = parts[1].parse::<u32>()
-                && uid >= SMB_USER_UID_MIN
-            {
-                users.push(SmbUser {
-                    username: parts[0].to_string(),
-                    uid,
-                });
+        for username in names {
+            let output = tokio::process::Command::new("id")
+                .args(["-u", &username])
+                .output()
+                .await;
+            let uid = match output {
+                Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+                    .trim()
+                    .parse()
+                    .unwrap_or(0),
+                _ => 0,
+            };
+            if uid >= SMB_USER_UID_MIN {
+                users.push(SmbUser { username, uid });
             }
         }
         Ok(users)
@@ -1250,34 +1133,21 @@ async fn next_available_gid() -> u32 {
     SMB_GROUP_GID_MIN
 }
 
-/// Set Samba password for a user via smbpasswd stdin.
-async fn set_smb_password(username: &str, password: &str) -> Result<(), SmbError> {
-    use tokio::io::AsyncWriteExt;
-    let mut child = tokio::process::Command::new("smbpasswd")
-        .args(["-a", "-s", username])
-        .stdin(std::process::Stdio::piped())
+/// Set ksmbd password via `ksmbd.adduser --password=…`.
+async fn set_ksmbd_password(username: &str, password: &str, add: bool) -> Result<(), SmbError> {
+    let action = if add { "--add" } else { "--update" };
+    let pwd_arg = format!("--password={password}");
+    let output = tokio::process::Command::new("ksmbd.adduser")
+        .args([action, &pwd_arg, username])
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| SmbError::ReloadFailed(format!("smbpasswd: {e}")))?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        // smbpasswd -s reads password twice from stdin
-        let input = format!("{password}\n{password}\n");
-        stdin
-            .write_all(input.as_bytes())
-            .await
-            .map_err(|e| SmbError::ReloadFailed(format!("smbpasswd stdin: {e}")))?;
-    }
-
-    let output = child
-        .wait_with_output()
+        .output()
         .await
-        .map_err(|e| SmbError::ReloadFailed(format!("smbpasswd wait: {e}")))?;
+        .map_err(|e| SmbError::ReloadFailed(format!("ksmbd.adduser: {e}")))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(SmbError::ReloadFailed(format!(
-            "smbpasswd failed: {stderr}"
+            "ksmbd.adduser failed: {stderr}"
         )));
     }
     Ok(())
@@ -1462,27 +1332,6 @@ mod tests {
     }
 
     #[test]
-    fn local_passdb_membership_requires_an_exact_principal_record() {
-        assert!(local_passdb_contains_principal(
-            "alice",
-            b"alice:1001:Alice Example\n"
-        ));
-        assert!(local_passdb_contains_principal(
-            "ALICE",
-            b"alice:1001:Alice Example\n"
-        ));
-        assert!(!local_passdb_contains_principal(
-            "alice",
-            b"alice2:1002:Alice Two\n"
-        ));
-        assert!(!local_passdb_contains_principal("alice", b"not-a-record\n"));
-        assert!(!local_passdb_contains_principal(
-            "alice",
-            b"bad\xffrecord\n"
-        ));
-    }
-
-    #[test]
     fn file_principal_validation_accepts_users_but_not_groups_or_whitespace() {
         assert!(validate_file_principal("alice").is_ok());
         assert!(validate_file_principal("CORP\\Alice Smith").is_ok());
@@ -1491,7 +1340,7 @@ mod tests {
         assert!(validate_file_principal("").is_err());
     }
 
-    // ── render_share_conf ──────────────────────────────────────────
+    // ── render_share_conf / ksmbd.conf ──────────────────────────────
 
     #[test]
     fn render_share_conf_minimal() {
@@ -1552,10 +1401,6 @@ mod tests {
 
     #[test]
     fn render_share_conf_quotes_spaced_valid_users_entries() {
-        // AD group names commonly contain spaces (`CORP\domain admins`).
-        // Unquoted, Samba splits the space-joined `valid users` list into
-        // two tokens — a broken group ref plus a bare `admins` that can
-        // match an unintended account. Quoting preserves entry boundaries.
         let mut share = minimal_share();
         share.valid_users = vec!["@CORP\\domain admins".to_string(), "alice".to_string()];
         let conf = render_share_conf(&share);
@@ -1578,104 +1423,48 @@ mod tests {
             .extra_params
             .insert("middle".to_string(), "v;injected\nx".to_string());
         let out = render_share_conf(&share);
-        // Sorted by key: alpha, middle, zeta.
         let alpha_pos = out.find("alpha = two").unwrap();
         let middle_pos = out.find("middle = ").unwrap();
         let zeta_pos = out.find("zeta = 1").unwrap();
         assert!(alpha_pos < middle_pos && middle_pos < zeta_pos);
-        // Injection chars in the value got stripped.
         assert!(out.contains("    middle = vinjectedx\n"));
     }
 
-    // ── render_include_list ──────────────────────────────────────────
-
     #[test]
-    fn include_list_puts_domain_conf_first() {
-        let rendered = render_include_list(&["abc.conf".to_string()]);
-        let domain_pos = rendered
-            .find("include = /etc/samba/nasty-domain.conf")
-            .expect("domain include present");
-        let tuning_pos = rendered
-            .find("include = /etc/samba/nasty-tuning.conf")
-            .unwrap();
-        let share_pos = rendered
-            .find("include = /etc/samba/nasty.d/abc.conf")
-            .unwrap();
-        // Global-scope ADS params must land before any share section opens.
-        assert!(
-            domain_pos < tuning_pos && tuning_pos < share_pos,
-            "{rendered}"
+    fn render_ksmbd_conf_puts_global_then_enabled_shares() {
+        let mut a = minimal_share();
+        a.name = "beta".into();
+        let mut b = minimal_share();
+        b.name = "alpha".into();
+        b.enabled = false;
+        let mut c = minimal_share();
+        c.name = "gamma".into();
+        let out = render_ksmbd_conf(
+            &[a, b, c],
+            &SmbTuningGlobals {
+                max_connections: 64,
+                deadtime: 15,
+            },
         );
+        assert!(out.contains("[global]\n"));
+        assert!(out.contains("    max connections = 64\n"));
+        assert!(out.contains("    deadtime = 15\n"));
+        assert!(out.contains("[beta]\n"));
+        assert!(out.contains("[gamma]\n"));
+        assert!(!out.contains("[alpha]\n"));
+        let beta = out.find("[beta]").unwrap();
+        let gamma = out.find("[gamma]").unwrap();
+        assert!(beta < gamma, "shares sorted by name: {out}");
     }
 
-    // ── Time Machine ───────────────────────────────────────────────────
-
     #[test]
-    fn render_share_conf_time_machine_emits_fruit_block() {
+    fn reject_time_machine_when_flag_set() {
         let mut share = minimal_share();
-        share.valid_users = vec!["alice".to_string()];
+        assert!(reject_time_machine(&share).is_ok());
         share.time_machine = true;
-        let out = render_share_conf(&share);
-        assert!(out.contains("    vfs objects = catia fruit streams_xattr\n"));
-        assert!(out.contains("    fruit:time machine = yes\n"));
-        assert!(out.contains("    fruit:metadata = stream\n"));
-        // No cap unless one is set.
-        assert!(!out.contains("fruit:time machine max size"));
-    }
-
-    #[test]
-    fn render_share_conf_time_machine_max_size() {
-        let mut share = minimal_share();
-        share.valid_users = vec!["alice".to_string()];
-        share.time_machine = true;
-        share.time_machine_max_size_gib = Some(500);
-        let out = render_share_conf(&share);
-        assert!(out.contains("    fruit:time machine max size = 500G\n"));
-    }
-
-    #[test]
-    fn render_share_conf_without_time_machine_emits_no_fruit() {
-        let out = render_share_conf(&minimal_share());
-        assert!(!out.contains("fruit:"));
-        assert!(!out.contains("vfs objects"));
-    }
-
-    #[test]
-    fn validate_time_machine_rejects_guest_and_readonly() {
-        let mut share = minimal_share();
-        share.time_machine = true;
-        share.valid_users = vec!["alice".to_string()];
-        assert!(validate_time_machine(&share).is_ok());
-
-        let mut guest = share.clone();
-        guest.guest_ok = true;
         assert!(matches!(
-            validate_time_machine(&guest),
-            Err(SmbError::TimeMachineRequiresAuth)
+            reject_time_machine(&share),
+            Err(SmbError::TimeMachineUnsupported)
         ));
-
-        let mut ro = share.clone();
-        ro.read_only = true;
-        assert!(matches!(
-            validate_time_machine(&ro),
-            Err(SmbError::TimeMachineRequiresAuth)
-        ));
-
-        // Non-TM shares are unaffected by guest/read-only.
-        let mut plain = minimal_share();
-        plain.guest_ok = true;
-        assert!(validate_time_machine(&plain).is_ok());
-    }
-
-    #[test]
-    fn timemachine_avahi_xml_lists_one_dk_per_share_or_none() {
-        // No shares → no file.
-        assert!(build_timemachine_avahi_xml(&[]).is_none());
-
-        let xml = build_timemachine_avahi_xml(&["TimeMachine".into(), "Backups".into()]).unwrap();
-        assert!(xml.contains("<type>_adisk._tcp</type>"));
-        assert!(xml.contains("sys=waMa=0,adVF=0x100"));
-        assert!(xml.contains("dk0=adVN=TimeMachine,adVF=0x82"));
-        assert!(xml.contains("dk1=adVN=Backups,adVF=0x82"));
     }
 }

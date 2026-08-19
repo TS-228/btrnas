@@ -1,7 +1,7 @@
-//! bcachefs filesystem and subvolume management
+//! btrfs filesystem and subvolume management
 //!
-//! This crate wraps bcachefs-tools CLI and sysfs interfaces
-//! to provide storage filesystem lifecycle operations.
+//! This crate wraps btrfs-progs CLI (`mkfs.btrfs`, `mount -t btrfs`,
+//! `btrfs scrub` / `subvolume`) for filesystem lifecycle operations.
 
 pub mod cmd;
 pub mod disk_type;

@@ -1,7 +1,7 @@
 //! Network configuration management — multi-interface, IPv4/IPv6, bonds, VLANs.
 //!
-//! Persists to `/var/lib/nasty/networking.json` and generates `/etc/nixos/networking.nix`.
-//! Changes are applied immediately via `ip` commands without a full nixos-rebuild.
+//! Persists to `/var/lib/nasty/networking.json`. Changes are applied
+//! immediately via NetworkManager / ip without a full system rebuild.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -2228,27 +2228,14 @@ async fn apply_config(
     // LAN-discovery daemons capture the live interface set at start
     // and don't all react to netlink topology changes. After a bridge
     // / bond / VLAN appears (or the management IP moves to a newly
-    // enslaved interface), `samba-wsdd` keeps announcing on the old
-    // set and Windows Explorer stops seeing the box; `avahi-daemon`
-    // is more dynamic but a clean restart costs ~1s of disrupted
-    // mDNS and reliably resets the publish list. Best-effort —
-    // discovery is UX, not the data path. Only restarts daemons that
-    // are currently active so we don't accidentally start one a
-    // protocol toggle had left disabled (#270).
+    // enslaved interface), `avahi-daemon` may still advertise a stale
+    // view; a clean restart costs ~1s of disrupted mDNS and resets
+    // the publish list. Best-effort — discovery is UX, not the data
+    // path. Only restarts daemons that are currently active (#270).
     //
-    // We deliberately do NOT rebind the data-path services here:
-    //
-    //   smbd / nmbd:  `interfaces =` is unset → 0.0.0.0 wildcard
-    //                 bind → picks up new interfaces automatically.
-    //                 Restart would also kick active SMB sessions.
-    //   nfs-server:   nfsd binds 0.0.0.0:2049 → same story; restart
-    //                 causes ESTALE on active mounts.
-    //   target.svc:   LIO portal config defaults to 0.0.0.0:3260;
-    //                 restart drops every initiator's session.
-    //   nvmet:        wildcard portals in configfs; same disruption.
-    //
-    // Discovery is what actually breaks under a bridge change — the
-    // data path is interface-agnostic by default.
+    // We deliberately do NOT rebind data-path services here (ksmbd /
+    // nfs / iSCSI / NVMe-oF bind wildcards by default; restart would
+    // drop sessions).
     rebind_discovery_daemons().await;
 
     // Re-issue the internal-CA cert so its SAN list matches the box's
@@ -2265,17 +2252,12 @@ async fn apply_config(
     Ok(outcome)
 }
 
-/// Restart the LAN-discovery daemons (`samba-wsdd`, `avahi-daemon`) that
-/// are currently active, so they re-announce on the box's present
-/// interface/IP set. Called after a network apply (the daemons strand on
-/// the pre-change interface set, #270) and after the SMB protocol is
-/// enabled (a freshly-started `samba-wsdd` can lose its startup
-/// WS-Discovery Hello before multicast membership settles, leaving the
-/// box invisible to Windows Explorer until a reboot, #291). Best-effort;
-/// only touches daemons already running so it never starts one a
-/// protocol toggle left off.
+/// Restart active LAN-discovery daemons so they re-announce on the
+/// box's present interface/IP set. Called after a network apply and
+/// after SMB is enabled. Best-effort; only touches daemons already
+/// running. `wsdd2` is a Depends of nasty-engine (Debian WSD daemon).
 pub(crate) async fn rebind_discovery_daemons() {
-    for unit in ["samba-wsdd.service", "avahi-daemon.service"] {
+    for unit in ["avahi-daemon.service", "wsdd2.service"] {
         let is_active = tokio::process::Command::new("systemctl")
             .args(["is-active", "--quiet", unit])
             .status()

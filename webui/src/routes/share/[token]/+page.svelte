@@ -15,8 +15,8 @@
 		type PublicShareMeta,
 		type PublicShareRoot
 	} from '$lib/public-share';
-	import logoLight from '$lib/assets/nasty.svg';
-	import logoDark from '$lib/assets/nasty-white.svg';
+	import logoLight from '$lib/assets/btrnas.svg';
+	import logoDark from '$lib/assets/btrnas-white.svg';
 	import { ArrowLeft, ChevronRight, Download, File, FolderOpen, Home, Lock } from '@lucide/svelte';
 
 	const token = $derived($page.params.token ?? '');
@@ -233,12 +233,12 @@
 </script>
 
 <svelte:head>
-	<title>Shared files - NASty</title>
+	<title>Shared files - btrNAS</title>
 </svelte:head>
 
 <div class="flex min-h-screen items-center justify-center bg-background p-3 sm:p-6">
 	<div class="w-full max-w-3xl rounded-xl border border-border bg-card p-4 shadow-sm sm:p-8">
-		<img src={theme.isDark ? logoDark : logoLight} alt="NASty" class="mx-auto mb-6 h-16" />
+		<img src={theme.isDark ? logoDark : logoLight} alt="btrNAS" class="mx-auto mb-6 h-16" />
 
 		{#if loading}
 			<p class="text-center text-sm text-muted-foreground">Loading...</p>

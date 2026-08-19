@@ -1,0 +1,29 @@
+# NASty Caddy site snippet — install as /etc/caddy/Caddyfile or import.
+{
+	admin 127.0.0.1:2019
+}
+
+:80 {
+	redir https://{host}{uri} permanent
+}
+
+:443 {
+	tls internal
+	root * /usr/share/nasty-webui
+	encode gzip
+	try_files {path} /index.html
+	file_server
+
+	handle /api/* {
+		reverse_proxy 127.0.0.1:2137
+	}
+	handle /rpc {
+		reverse_proxy 127.0.0.1:2137
+	}
+	handle /ws* {
+		reverse_proxy 127.0.0.1:2137
+	}
+	handle /health {
+		reverse_proxy 127.0.0.1:2137
+	}
+}

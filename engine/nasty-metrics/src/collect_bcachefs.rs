@@ -380,7 +380,8 @@ pub fn read_space(mount_point: &str) -> SpaceUsage {
     unsafe {
         let mut stat: libc::statvfs = std::mem::zeroed();
         if libc::statvfs(path.as_ptr(), &mut stat) == 0 {
-            let block_size = stat.f_frsize;
+            // f_frsize is c_ulong (u32 on armhf, u64 on amd64)
+            let block_size = stat.f_frsize as u64;
             let total = stat.f_blocks as u64 * block_size;
             let available = stat.f_bavail as u64 * block_size;
             let used = total.saturating_sub(stat.f_bfree as u64 * block_size);
@@ -474,26 +475,10 @@ pub fn read_compression_stats(sysfs: &Path) -> Vec<CompressionEntry> {
 // ── Collect all ─────────────────────────────────────────────────
 
 /// Collect all bcachefs metrics for all mounted filesystems.
+/// Disabled on this fork (data pools are btrfs); kept as an empty
+/// stub so Prometheus/render paths stay wired without /sys/fs/bcachefs.
 pub fn collect_all() -> Vec<BcachefsMetrics> {
-    let filesystems = discover_filesystems();
-    let mut all = Vec::new();
-
-    for fs in &filesystems {
-        let metrics = BcachefsMetrics {
-            uuid: fs.uuid.clone(),
-            fs_name: fs.fs_name.clone(),
-            counters: read_counters(&fs.sysfs_path),
-            time_stats: read_time_stats(&fs.sysfs_path),
-            devices: read_device_stats(&fs.sysfs_path),
-            space: read_space(&fs.mount_point),
-            options: read_fs_options(&fs.sysfs_path),
-            background: read_background_ops(&fs.sysfs_path),
-            compression: read_compression_stats(&fs.sysfs_path),
-        };
-        all.push(metrics);
-    }
-
-    all
+    Vec::new()
 }
 
 /// Sum the kernel-reported btree-node cache across filesystems. `None` means

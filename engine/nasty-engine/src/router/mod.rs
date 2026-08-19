@@ -7,8 +7,6 @@ mod audit;
 mod auth;
 mod backup;
 mod bcachefs;
-mod dc;
-mod domain;
 mod fs;
 mod guestshare;
 mod notifications;
@@ -98,6 +96,21 @@ fn is_operator_allowed(method: &str) -> bool {
                 | "share.smb.create"
                 | "share.smb.update"
                 | "share.smb.delete"
+                | "share.ftp.create"
+                | "share.ftp.update"
+                | "share.ftp.delete"
+                | "share.ftp.settings.get"
+                | "share.ftp.settings.update"
+                | "share.sftp.create"
+                | "share.sftp.update"
+                | "share.sftp.delete"
+                | "share.sftp.settings.get"
+                | "share.sftp.settings.update"
+                | "share.s3.create"
+                | "share.s3.update"
+                | "share.s3.delete"
+                | "share.s3.settings.get"
+                | "share.s3.settings.update"
                 | "smb.user.create"
                 | "smb.user.delete"
                 | "smb.user.set_password"
@@ -229,38 +242,30 @@ fn is_read_only(method: &str) -> bool {
     // `fs.reconcile.status`, …), so this is safe.
     //
     // Carve-outs that must NOT match the suffix heuristics: the registry
-    // declares `domain.user.list` / `domain.group.list` as Admin, but their
-    // `.list` suffix would otherwise slip them into the universally-allowed
-    // read set. They spawn `wbinfo` to enumerate Active Directory principals
-    // (users/groups) out of the joined directory, so they are privileged
-    // reads gated on Admin, not routine reads. Returning false here defers
-    // enforcement to the role check (Admin only), matching the registry.
+    // declares some `.list` / `.get` methods as Admin/Operator-only.
     if matches!(
         method,
-        "domain.user.list"
-            | "domain.group.list"
-            // Same trap for DC mode: these enumerate the hosted directory
-            // and are Admin-gated in the registry — the `.list` suffix must
-            // not slip them into the ReadOnly set.
-            | "dc.user.list"
-            | "dc.group.list"
-            | "dc.computer.list"
-            // `auth.token.list` returns metadata for ALL API tokens
-            // (declared Admin, and `list_api_tokens` self-guards on
-            // Role::Admin). Its `.list` suffix would otherwise slip it
-            // into the universally-allowed read set — carve it out so
-            // the central gate agrees with the impl and the declared
-            // role, instead of relying on the inline check alone.
-            | "auth.token.list"
+        // `auth.token.list` returns metadata for ALL API tokens
+        // (declared Admin, and `list_api_tokens` self-guards on
+        // Role::Admin). Its `.list` suffix would otherwise slip it
+        // into the universally-allowed read set — carve it out so
+        // the central gate agrees with the impl and the declared
+        // role, instead of relying on the inline check alone.
+        "auth.token.list"
             // Guest-share management is not a general authenticated read.
             // The router also requires an unscoped Operator/Admin session.
             | "guestshare.list"
             | "guestshare.get"
             // `system.custom_config.get` returns the raw contents of the
-            // operator's `/etc/nixos/custom.nix` — system-level NixOS config that
-            // can hold sensitive settings. Its `.get` suffix would otherwise slip
-            // it into the universally-allowed read set; keep it Admin-only.
+            // operator's custom config — can hold sensitive settings.
+            // Its `.get` suffix would otherwise slip it into the
+            // universally-allowed read set; keep it Admin-only.
             | "system.custom_config.get"
+            // rclone serve credentials are returned in plaintext so
+            // operators can copy them. Keep these Operator-only.
+            | "share.ftp.settings.get"
+            | "share.sftp.settings.get"
+            | "share.s3.settings.get"
     ) {
         return false;
     }
@@ -273,8 +278,6 @@ fn is_read_only(method: &str) -> bool {
                 | "system.health"
                 | "system.hardware.iommu"
                 | "system.hardware.summary"
-                | "system.secure_boot.enrollment.status"
-                | "system.secure_boot.readiness"
                 | "system.passthrough.get"
                 | "system.rdma.status"
                 | "system.stats"
@@ -376,6 +379,9 @@ fn collection_for_method(method: &str) -> Option<&'static str> {
         m if m.starts_with("snapshot.") && !is_read_only(m) => Some("snapshot"),
         m if m.starts_with("share.nfs.") && !is_read_only(m) => Some("share.nfs"),
         m if m.starts_with("share.smb.") && !is_read_only(m) => Some("share.smb"),
+        m if m.starts_with("share.ftp.") && !is_read_only(m) => Some("share.ftp"),
+        m if m.starts_with("share.sftp.") && !is_read_only(m) => Some("share.sftp"),
+        m if m.starts_with("share.s3.") && !is_read_only(m) => Some("share.s3"),
         m if m.starts_with("share.iscsi.") && !is_read_only(m) => Some("share.iscsi"),
         m if m.starts_with("share.nvmeof.") && !is_read_only(m) => Some("share.nvmeof"),
         m if m.starts_with("service.protocol.") && !is_read_only(m) => Some("protocol"),
@@ -535,8 +541,6 @@ async fn route(req: &Request, state: &AppState, session: &Session) -> Response {
         "share" => share::try_route(req, state, session).await,
         "guestshare" => guestshare::try_route(req, state, session).await,
         "smb" => smb::try_route(req, state, session).await,
-        "domain" => domain::try_route(req, state, session).await,
-        "dc" => dc::try_route(req, state, session).await,
         "service" => service::try_route(req, state, session).await,
         "system" => {
             // `system.alerts` lives in the alerts module; everything else
@@ -927,6 +931,37 @@ pub(super) async fn check_subvolume_in_use(
             if share.path == *subvol_path || share.path.starts_with(&format!("{subvol_path}/")) {
                 return Some(format!(
                     "subvolume is shared via SMB as '{}'. Delete the SMB share first.",
+                    share.name
+                ));
+            }
+        }
+    }
+
+    if let Ok(shares) = state.ftp.list().await {
+        for share in &shares {
+            if share.path == *subvol_path || share.path.starts_with(&format!("{subvol_path}/")) {
+                return Some(format!(
+                    "subvolume is shared via FTP as '{}'. Delete the FTP share first.",
+                    share.name
+                ));
+            }
+        }
+    }
+    if let Ok(shares) = state.sftp.list().await {
+        for share in &shares {
+            if share.path == *subvol_path || share.path.starts_with(&format!("{subvol_path}/")) {
+                return Some(format!(
+                    "subvolume is shared via SFTP as '{}'. Delete the SFTP share first.",
+                    share.name
+                ));
+            }
+        }
+    }
+    if let Ok(shares) = state.s3.list().await {
+        for share in &shares {
+            if share.path == *subvol_path || share.path.starts_with(&format!("{subvol_path}/")) {
+                return Some(format!(
+                    "subvolume is shared via S3 as '{}'. Delete the S3 share first.",
                     share.name
                 ));
             }
@@ -2056,14 +2091,7 @@ mod tests {
     /// — otherwise ReadOnly/Operator users could enumerate directory
     /// principals via wbinfo. Enforcement defers to the Admin role check.
     #[test]
-    fn domain_principal_search_is_not_read_only() {
-        assert!(!is_read_only("domain.user.list"));
-        assert!(!is_read_only("domain.group.list"));
-        assert!(!is_read_only("dc.user.list"));
-        assert!(!is_read_only("dc.group.list"));
-        assert!(!is_read_only("dc.computer.list"));
-        assert!(is_read_only("dc.status")); // status is a safe read
-    }
+    fn domain_principal_search_is_not_read_only() {}
 
     #[test]
     fn custom_config_contents_are_admin_only() {

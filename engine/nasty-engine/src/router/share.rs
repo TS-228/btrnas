@@ -317,6 +317,23 @@ async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Opti
         None
     };
 
+    if req.method.starts_with("share.ftp.")
+        || req.method.starts_with("share.sftp.")
+        || req.method.starts_with("share.s3.")
+    {
+        let resp = route_rclone(req, state, session).await;
+        if resp.error.is_none() && req.method.ends_with("settings.update") {
+            let proto = rclone_protocol(&req.method);
+            if let Err(e) = sync_rclone_firewall_ports(state, proto).await {
+                return Some(err(
+                    req,
+                    format!("settings saved but firewall port synchronization failed: {e}"),
+                ));
+            }
+        }
+        return Some(resp);
+    }
+
     Some(match req.method.as_str() {
         "share.nfs.list" => match state.nfs.list().await {
             Ok(v) => ok(req, v),
@@ -998,6 +1015,160 @@ async fn route_inner(req: &Request, state: &AppState, session: &Session) -> Opti
         }
         _ => return None,
     })
+}
+
+fn rclone_protocol(method: &str) -> nasty_system::protocol::Protocol {
+    if method.starts_with("share.ftp.") {
+        nasty_system::protocol::Protocol::Ftp
+    } else if method.starts_with("share.sftp.") {
+        nasty_system::protocol::Protocol::Sftp
+    } else {
+        nasty_system::protocol::Protocol::S3
+    }
+}
+
+fn rclone_service<'a>(state: &'a AppState, method: &str) -> &'a nasty_sharing::RcloneService {
+    if method.starts_with("share.ftp.") {
+        &state.ftp
+    } else if method.starts_with("share.sftp.") {
+        &state.sftp
+    } else {
+        &state.s3
+    }
+}
+
+pub(crate) async fn sync_rclone_firewall_ports(
+    state: &AppState,
+    proto: nasty_system::protocol::Protocol,
+) -> Result<(), String> {
+    if !state.protocols.is_enabled(proto).await {
+        return Ok(());
+    }
+    let svc = match proto {
+        nasty_system::protocol::Protocol::Ftp => &state.ftp,
+        nasty_system::protocol::Protocol::Sftp => &state.sftp,
+        nasty_system::protocol::Protocol::S3 => &state.s3,
+        _ => return Ok(()),
+    };
+    let listen = svc.listen_ports().await;
+    let mut ports = vec![nasty_system::firewall::PortSpec {
+        port: listen.port,
+        to: None,
+        transport: nasty_system::firewall::Transport::Tcp,
+        source: None,
+        iface: None,
+    }];
+    if let Some((from, to)) = listen.passive {
+        ports.push(nasty_system::firewall::PortSpec {
+            port: from,
+            to: Some(to),
+            transport: nasty_system::firewall::Transport::Tcp,
+            source: None,
+            iface: None,
+        });
+    }
+    state.firewall.set_service_ports(proto, ports).await
+}
+
+async fn route_rclone(req: &Request, state: &AppState, session: &Session) -> Response {
+    let proto = rclone_protocol(&req.method);
+    let svc = rclone_service(state, &req.method);
+    let suffix = req.method.rsplit_once('.').map(|(_, s)| s).unwrap_or("");
+    // `share.ftp.settings.get` / `share.ftp.settings.update` have two
+    // trailing segments; inspect the last two.
+    let settings_get = req.method.ends_with(".settings.get");
+    let settings_update = req.method.ends_with(".settings.update");
+
+    if settings_get {
+        return match svc.settings().await {
+            Ok(v) => ok(req, v),
+            Err(e) => err(req, e),
+        };
+    }
+    if settings_update {
+        if let Some(r) = require_protocol(state, req, proto).await {
+            return r;
+        }
+        return match parse_params::<nasty_sharing::rclone::UpdateRcloneSettingsRequest>(req) {
+            Ok(p) => match svc.update_settings(p).await {
+                Ok(v) => ok(req, v),
+                Err(e) => err(req, e),
+            },
+            Err(e) => invalid(req, e),
+        };
+    }
+
+    match suffix {
+        "list" => match svc.list().await {
+            Ok(v) => ok(req, v),
+            Err(e) => err(req, e),
+        },
+        "get" => match require_str(req, "id") {
+            Ok(id) => match svc.get(id).await {
+                Ok(v) => ok(req, v),
+                Err(e) => err(req, e),
+            },
+            Err(r) => r,
+        },
+        "create" => {
+            if let Some(r) = require_protocol(state, req, proto).await {
+                return r;
+            }
+            match parse_params::<nasty_sharing::rclone::CreateRcloneShareRequest>(req) {
+                Ok(mut p) => {
+                    if session_is_scoped(session)
+                        && svc.list().await.is_ok_and(|shares| {
+                            shares
+                                .iter()
+                                .any(|share| share.name.eq_ignore_ascii_case(&p.name))
+                        })
+                    {
+                        return err(req, "access denied");
+                    }
+                    match authorize_path_source(state, session, &p.path).await {
+                        Ok(path) => {
+                            p.path = path;
+                            match svc.create(p).await {
+                                Ok(v) => ok(req, v),
+                                Err(e) => err(req, e),
+                            }
+                        }
+                        Err(e) => err(req, e),
+                    }
+                }
+                Err(e) => invalid(req, e),
+            }
+        }
+        "update" => {
+            if let Some(r) = require_protocol(state, req, proto).await {
+                return r;
+            }
+            match parse_params::<nasty_sharing::rclone::UpdateRcloneShareRequest>(req) {
+                Ok(p) => match svc.update(p).await {
+                    Ok(v) => ok(req, v),
+                    Err(e) => err(req, e),
+                },
+                Err(e) => invalid(req, e),
+            }
+        }
+        "delete" => {
+            if let Some(r) = require_protocol(state, req, proto).await {
+                return r;
+            }
+            match parse_params::<nasty_sharing::rclone::DeleteRcloneShareRequest>(req) {
+                Ok(p) => match svc.delete(p).await {
+                    Ok(()) => ok(req, "ok"),
+                    Err(e) => err(req, e),
+                },
+                Err(e) => invalid(req, e),
+            }
+        }
+        _ => Response::error(
+            req.id.clone(),
+            ErrorCode::MethodNotFound,
+            format!("unknown method: {}", req.method),
+        ),
+    }
 }
 
 #[cfg(test)]

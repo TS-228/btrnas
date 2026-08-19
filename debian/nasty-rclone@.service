@@ -1,0 +1,22 @@
+[Unit]
+Description=NASty rclone %i file server
+Documentation=https://github.com/nasty-project/nasty
+After=network-online.target
+Wants=network-online.target
+# Started by the engine when the matching protocol (ftp/sftp/s3) is enabled.
+
+[Service]
+Type=simple
+ExecStart=/var/lib/nasty/rclone/%i-serve.sh
+Restart=on-failure
+RestartSec=3
+# Serve local paths under /fs; do not sandbox the filesystem.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+LimitNOFILE=65535
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target

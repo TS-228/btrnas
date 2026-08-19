@@ -1,48 +1,56 @@
-# Updating NASty
+# Updating NASty (Debian)
 
-NASty updates are normally applied from the WebUI (Settings → Update). This page covers manual recovery when an automatic update fails.
+Updates are applied from the WebUI (**Update** tab) or via apt. Both paths
+use **snapper** on the btrfs root filesystem so you can roll back.
 
-## Flake layout change (mid-2026)
+## WebUI
 
-The NixOS flake was moved from `nixos/flake.nix` to the repository root (`flake.nix`). Instances installed before this change may fail to update automatically because the running engine references the old path.
+1. Open **Update** → check for updates → **Upgrade**
+2. The engine runs `apt-get update` / `apt-get upgrade` in a transient
+   systemd unit (`nasty-update.service`)
+3. apt hooks create snapper **pre** / **post** snapshots automatically
+4. Reboot if the UI reports reboot required (new kernel, snapper rollback)
 
-### Symptoms
+## Generations (snapper)
 
-The update fails with errors like:
+The **Generations** tab lists snapper snapshots for config `root`.
 
-```
-error: path '/etc/nixos/flake.nix' does not exist
-```
+- **Switch** → `snapper -c root rollback <n>` then reboot
+- **Delete** → `snapper -c root delete <n>`
+- **Label** → stored in `/var/lib/nasty/generation-labels.json` and
+  snapper description when possible
 
-or:
-
-```
-error: getting status of '/etc/nixos/flake.lock': No such file or directory
-```
-
-### Fix
-
-SSH into your NASty box and run:
+## Manual apt upgrade
 
 ```bash
-cd /etc/nixos
-git fetch origin
-git reset --hard origin/main
-nixos-rebuild switch --flake /etc/nixos#nasty
+sudo apt-get update
+sudo apt-get upgrade
+snapper -c root list
 ```
 
-After this rebuild the engine has the correct paths and future updates from the WebUI will work normally.
-
-### Re-applying custom bcachefs version
-
-If you had a custom bcachefs-tools version pinned, re-apply it after the manual update:
+## Manual rollback
 
 ```bash
-# Check what was pinned
-cat /var/lib/nasty/bcachefs-tools-ref
-
-# Re-apply (replace REF with the value from above)
-cd /etc/nixos
-nix flake lock --override-input bcachefs-tools "github:koverstreet/bcachefs-tools/REF"
-nixos-rebuild switch --flake /etc/nixos#nasty
+snapper -c root list
+sudo snapper -c root --ambit classic rollback <snapshot-number>
+sudo reboot
 ```
+
+## Channels
+
+Release channel (mild / spicy / nasty) still selects which GitHub release
+tags the Version page compares against. Package installation itself always
+goes through apt candidates for `nasty`, `nasty-engine`, and `nasty-webui`.
+
+## Recovery without WebUI
+
+If the engine will not start after an upgrade:
+
+```bash
+snapper -c root list
+sudo snapper -c root --ambit classic rollback <good-snapshot>
+sudo reboot
+```
+
+Or boot a recovery environment, mount the btrfs root, and set the default
+subvolume to a known-good snapshot with `btrfs subvolume set-default`.

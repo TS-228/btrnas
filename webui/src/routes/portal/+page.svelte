@@ -16,8 +16,8 @@
 		PortalFileEntry,
 		PortalFileRoot,
 	} from '$lib/types';
-	import logoLight from '$lib/assets/nasty.svg';
-	import logoDark from '$lib/assets/nasty-white.svg';
+	import logoLight from '$lib/assets/btrnas.svg';
+	import logoDark from '$lib/assets/btrnas-white.svg';
 	import { theme } from '$lib/theme.svelte';
 	import {
 		Activity,
@@ -224,13 +224,13 @@
 </script>
 
 <svelte:head>
-	<title>My Files - NASty</title>
+	<title>My Files - btrNAS</title>
 </svelte:head>
 
 <div class="min-h-screen bg-background">
 	<header class="sticky top-0 z-30 border-b border-border bg-card/95 backdrop-blur">
 		<div class="mx-auto flex h-16 max-w-6xl items-center gap-3 px-4 sm:px-6">
-			<img src={theme.isDark ? logoDark : logoLight} alt="NASty" class="h-10 w-auto shrink-0" />
+			<img src={theme.isDark ? logoDark : logoLight} alt="btrNAS" class="h-10 w-auto shrink-0" />
 			<div class="hidden h-6 w-px bg-border sm:block"></div>
 			<p class="hidden text-xs font-medium uppercase tracking-[0.2em] text-muted-foreground sm:block">File portal</p>
 			<div class="ml-auto min-w-0 text-right">

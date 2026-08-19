@@ -8,143 +8,49 @@
 		formatBytes,
 		formatPercent
 	} from '$lib/format';
-	import { withToast, success as toastSuccess } from '$lib/toast.svelte';
+	import { withToast } from '$lib/toast.svelte';
 
 	let pageTab = $state<'manage' | 'diagnostics'>(
 		typeof window !== 'undefined' && window.location.hash === '#diagnostics' ? 'diagnostics' : 'manage'
 	);
 	import { confirm } from '$lib/confirm.svelte';
 	import { confirmDangerous } from '$lib/confirm-dangerous.svelte';
-	import { unlockFs } from '$lib/unlock-fs.svelte';
 	import { summarizeDependents } from '$lib/fs-dependents';
-	import type { Filesystem, UnavailableFilesystem, FilesystemDevice, BlockDevice, DeviceState, ScrubStatus, FsckStatus, ReconcileStatus, TieringProfile, TieringProfileId, FsDependents, TpmBindStatus, DiskHealth } from '$lib/types';
+	import type { Filesystem, UnavailableFilesystem, FilesystemDevice, BlockDevice, ScrubStatus, FsckStatus, FsDependents } from '$lib/types';
 	import { Button } from '$lib/components/ui/button';
 	import SortTh from '$lib/components/SortTh.svelte';
 	import { Card, CardContent } from '$lib/components/ui/card';
 	import { Badge } from '$lib/components/ui/badge';
 	import { Input } from '$lib/components/ui/input';
 	import { Label } from '$lib/components/ui/label';
-	import { RefreshCw, Pencil } from '@lucide/svelte';
 
 	let filesystems: Filesystem[] = $state([]);
 	let unavailableFilesystems: UnavailableFilesystem[] = $state([]);
 	let devices: BlockDevice[] = $state([]);
-	/** SMART health per disk (system.disks), joined by path to give an
-	 * add-device candidate its health summary before it joins an fs. */
-	let diskHealth: DiskHealth[] = $state([]);
-	let tpmStatus: Record<string, TpmBindStatus> = $state({});
 	/** Per-FS scrub state populated by `refresh()` alongside fs.list, and
 	 * re-polled while any scrub is running. Drives the inline chip +
-	 * Scrub button on every FS row in the Manage view (not just the
-	 * expanded one — the existing `scrubStatus` singleton only loaded
-	 * when an FS was expanded, which is why operators couldn't see
-	 * "last scrubbed N days ago" at a glance). */
+	 * Scrub button on every FS row. */
 	let scrubStatuses: Record<string, ScrubStatus> = $state({});
 	/** Interval handle for the running-scrub poller. Lazily started
-	 * when any FS reports `running`, cleared when none do. 5s cadence
-	 * is plenty — `bcachefs scrub` on a multi-TB pool runs for
-	 * hours, sub-second progress updates aren't useful. */
+	 * when any FS reports `running`, cleared when none do. */
 	let scrubPoll: ReturnType<typeof setInterval> | null = null;
-	// Host-level TPM availability — same value across every FS on
-	// this box. Cached at refresh time so the create-wizard's "Bind
-	// to TPM" checkbox can be conditionally shown even before the
-	// first encrypted FS exists. Falls back to `false` until the
-	// first probe completes.
-	let hostTpmAvailable = $state(false);
-	let wizardStep: 0 | 1 | 2 | 3 = $state(0); // 0=hidden, 1=name+devices, 2=profile, 3=review
+	let wizardStep: 0 | 1 | 2 = $state(0); // 0=hidden, 1=name+devices, 2=review
 	let loading = $state(true);
 
 	// Wizard state
 	let newName = $state('first');
 	let selectedPaths: string[] = $state([]);
-	let wizardProfile: TieringProfileId = $state('single');
 	let replicas = $state(1);
 	let compression = $state('');
 	let compressionLevel = $state('');
 	let showPartitions = $state(false);
-	let erasureCode = $state(false);
-	let versionUpgrade = $state('');
-	let encryption = $state(false);
-	let passphrase = $state('');
-	let passphraseConfirm = $state('');
-	let storeKey = $state(true);
-	let bindToTpm = $state(false);
-	let dataChecksum = $state('');
-	let metadataChecksum = $state('');
-	let bucketSize = $state('');
-	let encodedExtentMax = $state('');
-	let degraded = $state(false);
-	let verbose = $state(false);
-	let mountFsck = $state(false);
-	let journalFlushDisabled = $state(false);
-	let journalFlushDelay = $state('');
-
-	// Manual tiering state
-	let manualLabels: Record<string, string> = $state({});
-	let manualFgTarget = $state('');
-	let manualMetaTarget = $state('');
-	let manualBgTarget = $state('');
-	let manualPromoteTarget = $state('');
 
 	let expandedFs: string | null = $state(null);
 	let editOptionsFs: string | null = $state(null);
 	let editCompression = $state('');
 	let editCompressionLevel = $state('');
-	let editBgCompression = $state('');
-	let editBgCompressionLevel = $state('');
-	// bcachefs tiering targets (#434) — each points at a device label.
-	let editForegroundTarget = $state('');
-	let editBackgroundTarget = $state('');
-	let editMetadataTarget = $state('');
-	let editPromoteTarget = $state('');
-	let addDeviceFs: string | null = $state(null);
-	let addDevicePath = $state('');
-	let addDeviceLabel = $state('');
-	let addDeviceDurability = $state('1');
-	let showAddPartitions = $state(false);
-	let editErasureCode = $state(false);
-	let editDataChecksum = $state('');
-	let editMetadataChecksum = $state('');
-	let editVersionUpgrade = $state('');
-	let editDataReplicas = $state(1);
-	let editMetadataReplicas = $state(1);
-	let editMoveIos = $state(32);
-	let editMoveBytes = $state('');
-	let editDegraded = $state(false);
-	let editVerbose = $state(false);
-	let editFsck = $state(false);
-	let editJournalFlushDisabled = $state(false);
-	let editJournalFlushDelay = $state('');
 
-	let showCreateAdvanced = $state(false);
 	let showCreateCommands = $state(false);
-	let showEditAdvanced = $state(false);
-
-	// Inline label editing: key is "fsName|devicePath"
-	let editingLabel: string | null = $state(null);
-	let editLabelValue = $state('');
-
-	async function saveDeviceLabel(fsName: string, devicePath: string) {
-		const key = `${fsName}|${devicePath}`;
-		if (editingLabel !== key) return;
-		editingLabel = null;
-		const label = editLabelValue.trim();
-		await withToast(
-			() => client.call('fs.device.set_label', { filesystem: fsName, device: devicePath, label }),
-			`Label updated for ${devicePath}`
-		);
-		await refresh();
-	}
-
-	function startEditLabel(fsName: string, dev: FilesystemDevice) {
-		editingLabel = `${fsName}|${dev.path}`;
-		editLabelValue = dev.label ?? '';
-	}
-
-	let healthFs: string | null = $state(null);
-	let scrubStatus: ScrubStatus | null = $state(null);
-	let reconcileStatus: ReconcileStatus | null = $state(null);
-	let healthLoading = $state(false);
 
 	const client = getClient();
 
@@ -153,7 +59,6 @@
 		if (p?.collection === 'filesystem') refresh();
 	}
 
-	let evacuationPoll: ReturnType<typeof setInterval> | null = null;
 
 	function updateScrubPolling() {
 		const anyRunning = Object.values(scrubStatuses).some((s) => s.running);
@@ -205,7 +110,7 @@
 	function scrubChip(s: ScrubStatus | undefined): { label: string; cls: string; title: string } {
 		if (!s) return { label: 'scrub: —', cls: 'text-muted-foreground', title: 'No scrub data' };
 		if (s.running) {
-			// Prefer the parsed bcachefs percent when we have one;
+			// Prefer the parsed scrub percent when we have one;
 			// fall back to elapsed time so a tools build that doesn't
 			// print percent (or hasn't yet) still shows motion.
 			const since = s.started_at ? humanAgo(s.started_at) : 'now';
@@ -285,7 +190,7 @@
 	async function startFsckInline(fsName: string, repair: boolean) {
 		if (repair && !await confirm(
 			`Repair "${fsName}" with fsck?`,
-			`This runs "bcachefs fsck -y" and will modify the filesystem to correct errors it finds. Run a dry run first if you're unsure. Make sure you have backups of irreplaceable data.`
+			`This runs "btrfs check --repair" and will modify the filesystem to correct errors it finds. Run a dry run first if you're unsure. Make sure you have backups of irreplaceable data.`
 		)) return;
 		const ok = await withToast(
 			() => client.call('fs.fsck.start', { name: fsName, repair }),
@@ -321,20 +226,6 @@
 		return { label: `${kind} failed ${ago}`, cls: 'text-red-500' };
 	}
 
-	function startEvacuationPolling() {
-		if (evacuationPoll) return;
-		evacuationPoll = setInterval(async () => {
-			await refresh();
-			const hasEvacuating = filesystems.some(fs =>
-				fs.devices.some(d => d.state === 'evacuating')
-			);
-			if (!hasEvacuating && evacuationPoll) {
-				clearInterval(evacuationPoll);
-				evacuationPoll = null;
-			}
-		}, 5000);
-	}
-
 	onMount(async () => {
 		client.onEvent(handleEvent);
 		try {
@@ -342,21 +233,17 @@
 			if (saved) {
 				const parsed = JSON.parse(saved);
 				if (Array.isArray(parsed)) visibleDeviceCols = parsed.filter((c) => typeof c === 'string');
-			}
+		}
 		} catch { /* ignore malformed pref */ }
 		await refresh();
 		loading = false;
 		if (typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('create')) {
 			openWizard();
 		}
-		if (filesystems.some(fs => fs.devices.some(d => d.state === 'evacuating'))) {
-			startEvacuationPolling();
-		}
 	});
 
 	onDestroy(() => {
 		client.offEvent(handleEvent);
-		if (evacuationPoll) { clearInterval(evacuationPoll); evacuationPoll = null; }
 		if (scrubPoll) { clearInterval(scrubPoll); scrubPoll = null; }
 		if (fsckPoll) { clearInterval(fsckPoll); fsckPoll = null; }
 	});
@@ -370,41 +257,8 @@
 		if (liveResult) filesystems = liveResult;
 		if (unavailableResult) unavailableFilesystems = unavailableResult;
 		if (deviceResult) devices = deviceResult;
-		// Drop pending-evacuation markers once the live state confirms
-		// them (or the device vanished, or the marker went stale — an
-		// evacuation that finished instantly never shows `evacuating`).
-		for (const [p, t] of Object.entries(pendingEvacuation)) {
-			const dev = filesystems.flatMap(f => f.devices).find(d => d.path === p);
-			if (!dev || dev.state === 'evacuating' || Date.now() - t > 30_000) {
-				delete pendingEvacuation[p];
-			}
-		}
-		// SMART health for the add-device candidate summaries (best-effort;
-		// virtual disks / no-SMART setups just render "no SMART").
-		diskHealth = await client.call<DiskHealth[]>('system.disks').catch(() => []);
-		// Refresh TPM bind state for encrypted filesystems in parallel.
-		// Non-encrypted FSes are skipped — the engine would return
-		// `tpm_available` correctly but `bound: false` is uninteresting.
-		const encrypted = filesystems.filter((fs) => fs.options.encrypted);
-		const results = await Promise.all(
-			encrypted.map(async (fs) => {
-				try {
-					const status = await client.call<TpmBindStatus>('fs.tpm.status', { name: fs.name });
-					return [fs.name, status] as const;
-				} catch {
-					return null;
-				}
-			})
-		);
-		const next: Record<string, TpmBindStatus> = {};
-		for (const r of results) if (r) next[r[0]] = r[1];
-		tpmStatus = next;
 
-		// Pull scrub state for every FS (including unmounted — the
-		// engine reads from persistent state and only does the
-		// pgrep cross-check for mounted FSes). Errors here are
-		// surfaced as "Never scrubbed" rather than blocking the
-		// page render.
+		// Pull scrub state for every FS. Errors surface as "Never scrubbed".
 		const scrubResults = await Promise.all(
 			filesystems.map(async (fs) => {
 				try {
@@ -418,8 +272,7 @@
 		scrubStatuses = nextScrub;
 		updateScrubPolling();
 
-		// fsck state is only meaningful for unmounted filesystems (an
-		// offline check can't run while mounted), so only fetch for those.
+		// fsck state is only meaningful for unmounted filesystems.
 		const fsckResults = await Promise.all(
 			filesystems.filter((fs) => !fs.mounted).map(async (fs) => {
 				try {
@@ -432,273 +285,44 @@
 		for (const r of fsckResults) if (r) nextFsck[r[0]] = r[1];
 		fsckStatuses = nextFsck;
 		updateFsckPolling();
-		// Probe host-level TPM availability: re-use any existing
-		// status if we have one (same value across all FSes), or
-		// fire a one-off `fs.tpm.status` against a sentinel name
-		// when no encrypted FS exists yet (the engine's tpm_status
-		// doesn't actually require the FS to exist — it just reports
-		// the host's `/dev/tpmrm0` presence). Without this, the
-		// create-wizard's "Bind to TPM" checkbox would be hidden on
-		// every fresh box that hasn't created an FS yet.
-		const anyStatus = Object.values(next)[0];
-		if (anyStatus) {
-			hostTpmAvailable = anyStatus.tpm_available;
-		} else {
-			try {
-				const probe = await client.call<TpmBindStatus>('fs.tpm.status', { name: '__host_probe' });
-				hostTpmAvailable = probe.tpm_available;
-			} catch {
-				hostTpmAvailable = false;
-			}
-		}
-	}
-
-	async function bindTpm(fs: Filesystem) {
-		const ok = await confirm(
-			`Bind "${fs.name}" to TPM2`,
-			`The stored encryption key will be sealed against this host's TPM2 and bound to PCR 7 (Secure Boot state). Auto-unlock at boot will prefer the sealed copy. The plaintext key file is kept as a recovery path; remove it explicitly with Export Key → Destroy Key later if desired.\n\nContinue?`,
-			{ confirmLabel: 'Bind' }
-		);
-		if (!ok) return;
-		await withToast(
-			() => client.call<TpmBindStatus>('fs.tpm.bind', { name: fs.name }),
-			`Filesystem "${fs.name}" sealed to TPM2.`
-		);
-		await refresh();
-	}
-
-	async function unbindTpm(fs: Filesystem) {
-		const ok = await confirm(
-			`Unbind "${fs.name}" from TPM2`,
-			`The sealed TPM blob will be removed. Auto-unlock will fall back to the plaintext .key file (if present) or require a passphrase.\n\nContinue?`,
-			{ confirmLabel: 'Unbind' }
-		);
-		if (!ok) return;
-		await withToast(
-			() => client.call<TpmBindStatus>('fs.tpm.unbind', { name: fs.name }),
-			`TPM seal removed for "${fs.name}".`
-		);
-		await refresh();
-	}
-
-	// ── Tiering profile logic ────────────────────────────────────
-
-	function selectedDeviceObjects(): BlockDevice[] {
-		return selectedPaths
-			.map(p => devices.find(d => d.path === p))
-			.filter(Boolean) as BlockDevice[];
-	}
-
-	function buildProfiles(): TieringProfile[] {
-		const sel = selectedDeviceObjects();
-		const hasNvme = sel.some(d => d.device_class === 'nvme');
-		const hasSsd  = sel.some(d => d.device_class === 'ssd');
-		const hasHdd  = sel.some(d => d.device_class === 'hdd' || d.device_class === 'mmc');
-		const hasFast = hasNvme || hasSsd;
-		const hasSlow = hasHdd;
-		const has3Tiers = hasNvme && (hasSsd || hasHdd);
-
-		// Single label for single-tier: use filesystem name as group
-		const singleLabels: Record<string, string> = {};
-		sel.forEach(d => { singleLabels[d.path] = newName; });
-
-		// Write-cache labels: fast = nvme/ssd → "fast", hdd → "slow"
-		const wcLabels: Record<string, string> = {};
-		sel.forEach(d => { wcLabels[d.path] = (d.device_class === 'hdd' || d.device_class === 'mmc') ? 'slow' : 'fast'; });
-
-		// Full-tier labels by device class
-		const ftLabels: Record<string, string> = {};
-		sel.forEach(d => { ftLabels[d.path] = d.device_class; });
-
-		// Full-tier targets
-		let ftFg: string | null = null;
-		let ftMeta: string | null = null;
-		let ftBg: string | null = null;
-		let ftPromote: string | null = null;
-		if (hasNvme) {
-			ftFg = 'nvme'; ftMeta = 'nvme';
-			if (hasHdd) { ftBg = 'hdd'; if (hasSsd) ftPromote = 'ssd'; }
-			else if (hasSsd) { ftBg = 'ssd'; }
-		}
-
-		const recommended = hasNvme && (hasSsd || hasHdd) ? 'full_tiering'
-			: hasFast && hasSlow ? 'write_cache'
-			: 'single';
-
-		return [
-			{
-				id: 'single',
-				name: 'Single Tier',
-				tagline: 'Simple — all devices in one filesystem',
-				description: 'All devices are treated as equal peers. bcachefs stripes data across them based on capacity. No performance tiers.',
-				available: true,
-				recommended: recommended === 'single',
-				foreground_target: null,
-				metadata_target: null,
-				background_target: null,
-				promote_target: null,
-				device_labels: {},
-			},
-			{
-				id: 'write_cache',
-				name: 'Write Cache + Cold Storage',
-				tagline: 'Writes land on fast devices, cold data migrates to slow',
-				description: 'Writes go to the fast tier first (NVMe/SSD). Over time, background I/O migrates cold data to the slow tier (HDD), freeing fast space for new writes.',
-
-				available: hasFast && hasSlow,
-				recommended: recommended === 'write_cache',
-				foreground_target: 'fast',
-				metadata_target: 'fast',
-				background_target: 'slow',
-				promote_target: null,
-				device_labels: wcLabels,
-			},
-			{
-				id: 'full_tiering',
-				name: 'Full Tiering',
-				tagline: 'NVMe writes, SSD read cache, HDD cold storage',
-				description: `NVMe handles all writes and metadata. Hot reads are served from the SSD read cache. Cold data moves to HDD in the background. Maximum performance with large capacity.${!has3Tiers ? ' (You can add SSD devices later to enable the read-cache tier.)' : ''}`,
-				available: has3Tiers,
-				recommended: recommended === 'full_tiering',
-				foreground_target: ftFg,
-				metadata_target: ftMeta,
-				background_target: ftBg,
-				promote_target: ftPromote,
-				device_labels: ftLabels,
-			},
-			{
-				id: 'none',
-				name: 'No Tiering',
-				tagline: 'No labels or targets — bcachefs default behavior',
-				description: 'No device labels or IO targets are set. bcachefs will distribute data evenly across all devices using its built-in balancing. Useful when all devices are equivalent and you want the simplest possible setup.',
-				available: true,
-				recommended: false,
-				foreground_target: null,
-				metadata_target: null,
-				background_target: null,
-				promote_target: null,
-				device_labels: {},
-			},
-			{
-				id: 'manual',
-				name: 'Manual',
-				tagline: 'Set device labels and IO targets manually',
-				description: 'Assign custom labels to each device and configure foreground, metadata, background, and promote targets manually. For advanced users who want full control over tiering behavior.',
-				available: true,
-				recommended: false,
-				foreground_target: manualFgTarget || null,
-				metadata_target: manualMetaTarget || null,
-				background_target: manualBgTarget || null,
-				promote_target: manualPromoteTarget || null,
-				device_labels: { ...manualLabels },
-			},
-		];
-	}
-
-	function activeProfile(): TieringProfile {
-		return buildProfiles().find(p => p.id === wizardProfile) ?? buildProfiles()[0];
 	}
 
 	function buildFormatCommand(): string[] {
-		const profile = activeProfile();
-		const args = ['bcachefs', 'format', `--fs_label=${newName}`];
-
-		if (replicas > 1) args.push(`--replicas=${replicas}`);
-		{
-			const comp = combineCompression(compression, compressionLevel);
-			if (comp) args.push(`--compression=${comp}`);
+		const args = ['mkfs.btrfs', '-f', '-L', newName];
+		if (replicas >= 2) {
+			args.push('-d', 'raid1', '-m', 'raid1');
+		} else if (selectedPaths.length === 1) {
+			args.push('-d', 'single', '-m', 'dup');
+		} else {
+			args.push('-d', 'single', '-m', 'raid1');
 		}
-		if (profile.foreground_target) args.push(`--foreground_target=${profile.foreground_target}`);
-		if (profile.metadata_target) args.push(`--metadata_target=${profile.metadata_target}`);
-		if (profile.background_target) args.push(`--background_target=${profile.background_target}`);
-		if (profile.promote_target) args.push(`--promote_target=${profile.promote_target}`);
-		if (encryption) args.push('--encrypted');
-		if (erasureCode) args.push('--erasure_code');
-		if (dataChecksum) args.push(`--data_checksum=${dataChecksum}`);
-		if (metadataChecksum) args.push(`--metadata_checksum=${metadataChecksum}`);
-		if (bucketSize) args.push(`--bucket=${bucketSize}`);
-		if (encodedExtentMax) args.push(`--encoded_extent_max=${encodedExtentMax}`);
-
-		const hasTargets = !!(profile.foreground_target || profile.metadata_target || profile.background_target || profile.promote_target);
-		for (const path of selectedPaths) {
-			const label = profile.device_labels[path];
-			if (label) {
-				args.push(`--label=${label}`);
-			} else if (hasTargets) {
-				args.push(`--label=${newName}`);
-			}
-			args.push(path);
-		}
-
+		args.push(...selectedPaths);
 		return args;
 	}
 
 	function buildMountCommand(): string[] {
-		const deviceArg = selectedPaths.join(':');
-		const opts = ['prjquota'];
-		if (versionUpgrade) opts.push(`version_upgrade=${versionUpgrade}`);
-		if (degraded) opts.push('degraded');
-		if (verbose) opts.push('verbose');
-		if (mountFsck) opts.push('fsck');
-		if (journalFlushDisabled) opts.push('journal_flush_disabled');
-		if (journalFlushDelay) opts.push(`journal_flush_delay=${journalFlushDelay}`);
-		return ['bcachefs', 'mount', '-o', opts.join(','), deviceArg, `/fs/${newName}`];
+		const deviceArg = selectedPaths[0] ?? '';
+		return ['mount', '-t', 'btrfs', '-o', 'prjquota', deviceArg, `/fs/${newName}`];
 	}
 
 	function formatCommandLines(args: string[]): string {
-		if (args.length <= 4) return args.join(' ');
-		const parts: string[] = [args[0] + ' ' + args[1]]; // "bcachefs format"
-		for (let i = 2; i < args.length; i++) {
-			const arg = args[i];
-			if (arg.startsWith('--label=')) {
-				// Per-device group: label + device path on one line
-				const next = args[i + 1] && !args[i + 1].startsWith('--') ? ' ' + args[++i] : '';
-				parts.push('  ' + arg + next);
-			} else if (arg.startsWith('--')) {
-				// Global option
-				parts.push('  ' + arg);
-			} else {
-				// Bare device path (no label)
-				parts.push('  ' + arg);
-			}
+		if (args.length <= 6) return args.join(' ');
+		const parts: string[] = [args[0]];
+		for (let i = 1; i < args.length; i++) {
+			parts.push('  ' + args[i]);
 		}
 		return parts.join(' \\\n');
 	}
 
-	$effect(() => {
-		if (erasureCode && replicas < 2) replicas = 2;
-		if (erasureCode && selectedPaths.length < 3) erasureCode = false;
-	});
-
 	async function createFs() {
 		if (!newName || selectedPaths.length === 0) return;
-		if (erasureCode && selectedPaths.length < replicas + 1) return;
-		if (encryption && (!passphrase || passphrase !== passphraseConfirm)) return;
-		const profile = activeProfile();
+		if (replicas === 2 && selectedPaths.length < 2) return;
 		const ok = await withToast(
 			() => client.call('fs.create', {
 				name: newName,
-				devices: selectedPaths.map(path => ({
-					path,
-					label: profile.device_labels[path] || undefined,
-				})),
+				devices: selectedPaths.map(path => ({ path })),
 				replicas,
 				compression: combineCompression(compression, compressionLevel) || undefined,
-				foreground_target: profile.foreground_target || undefined,
-				metadata_target: profile.metadata_target || undefined,
-				background_target: profile.background_target || undefined,
-				promote_target: profile.promote_target || undefined,
-				erasure_code: erasureCode || undefined,
-				encryption: encryption || undefined,
-				passphrase: encryption ? passphrase : undefined,
-				store_key: encryption ? storeKey : undefined,
-				bind_to_tpm: encryption && storeKey && bindToTpm ? true : undefined,
-				data_checksum: dataChecksum || undefined,
-				metadata_checksum: metadataChecksum || undefined,
-				bucket_size: bucketSize || undefined,
-				encoded_extent_max: encodedExtentMax || undefined,
-				version_upgrade: versionUpgrade || undefined,
-				journal_flush_delay: journalFlushDelay ? parseInt(journalFlushDelay) : undefined,
 			}),
 			`Filesystem "${newName}" created`
 		);
@@ -706,28 +330,9 @@
 			wizardStep = 0;
 			newName = 'first';
 			selectedPaths = [];
-			wizardProfile = 'single';
-			manualLabels = {};
-			manualFgTarget = '';
-			manualMetaTarget = '';
-			manualBgTarget = '';
-			manualPromoteTarget = '';
-			erasureCode = false;
-			versionUpgrade = '';
-			encryption = false;
-			passphrase = '';
-			passphraseConfirm = '';
-			storeKey = true;
-			bindToTpm = false;
-			dataChecksum = '';
-			metadataChecksum = '';
-			bucketSize = '';
-			encodedExtentMax = '';
-			degraded = false;
-			verbose = false;
-			mountFsck = false;
-			journalFlushDisabled = false;
-			journalFlushDelay = '';
+			replicas = 1;
+			compression = '';
+			compressionLevel = '';
 			await refresh();
 		}
 	}
@@ -735,31 +340,17 @@
 	function openWizard() {
 		newName = 'first';
 		selectedPaths = [];
-		wizardProfile = 'single';
 		replicas = 1;
 		compression = '';
 		compressionLevel = '';
-		// Auto-show partitions if no full disks are available
 		const hasFullDisks = devices.some(d => !d.in_use && d.dev_type !== 'part');
 		showPartitions = !hasFullDisks;
-		manualLabels = {};
-		manualFgTarget = '';
-		manualMetaTarget = '';
-		manualBgTarget = '';
-		manualPromoteTarget = '';
-		erasureCode = false;
-		showCreateAdvanced = false;
 		showCreateCommands = false;
 		wizardStep = 1;
 	}
 
 	function wizardNext() {
-		if (wizardStep === 1) {
-			// Auto-select recommended profile
-			const rec = buildProfiles().find(p => p.recommended && p.available);
-			if (rec) wizardProfile = rec.id;
-		}
-		wizardStep = (wizardStep + 1) as 1 | 2 | 3;
+		wizardStep = (wizardStep + 1) as 1 | 2;
 	}
 
 	async function destroyFs(name: string) {
@@ -783,7 +374,7 @@
 			);
 		} catch { /* The backend still validates dependents before forgetting. */ }
 
-		let message = `This removes only NASty's saved configuration for "${fs.name}" and stops its auto-mount attempts and alerts. It does not erase or modify any disks. If the member disks are reconnected, they retain their bcachefs data.`;
+		let message = `This removes only NASty's saved configuration for "${fs.name}" and stops its auto-mount attempts and alerts. It does not erase or modify any disks. If the member disks are reconnected, they retain their btrfs data.`;
 		if (dependents) {
 			message += `\n\nNASty reports these dependents; the backend will block forgetting while they remain:\n\n${dependents}`;
 		}
@@ -829,7 +420,7 @@
 
 	async function toggleMount(fs: Filesystem) {
 		if (fs.mounted) {
-			if (!await confirm(`Unmount Filesystem "${fs.name}"`, `Any active NFS, SMB, iSCSI, and NVMe-oF shares on this filesystem will be stopped first.`)) return;
+			if (!await confirm(`Unmount Filesystem "${fs.name}"`, `Any active NFS, SMB, FTP, SFTP, S3, iSCSI, and NVMe-oF shares on this filesystem will be stopped first.`)) return;
 		}
 		const action = fs.mounted ? 'unmount' : 'mount';
 		mountingFs = fs.name;
@@ -843,153 +434,6 @@
 		await refresh();
 	}
 
-	// ── Per-device action busy state (#479) ──
-	// While a device action RPC is in flight, every button on that
-	// row disables — a slow operation must not be hammerable, and the
-	// ghosted row is itself the "something is happening" signal.
-	let busyDevices = $state<Record<string, boolean>>({});
-	/** Devices we just told the engine to evacuate, displayed as
-	 * `evacuating` until a refresh observes the real state flip.
-	 * bcachefs takes a moment to persist the state, and in that gap
-	 * the row would otherwise re-offer Evacuate (#479). Value is the
-	 * time the marker was set, so a stuck marker (instant-finish
-	 * evacuation that never shows `evacuating`) expires. */
-	let pendingEvacuation = $state<Record<string, number>>({});
-
-	async function runDeviceAction(devicePath: string, fn: () => Promise<unknown>) {
-		busyDevices[devicePath] = true;
-		try {
-			await fn();
-		} finally {
-			delete busyDevices[devicePath];
-		}
-	}
-
-	async function addDevice(fsName: string) {
-		if (!addDevicePath) return;
-		await runDeviceAction(addDevicePath, async () => {
-			const ok = await withToast(
-				() => client.call('fs.device.add', {
-					filesystem: fsName,
-					device: {
-						path: addDevicePath,
-						label: addDeviceLabel || undefined,
-						durability: addDeviceDurability !== '' ? parseInt(addDeviceDurability) : undefined,
-					},
-				}),
-				`Device ${addDevicePath} added to "${fsName}"`
-			);
-			if (ok !== undefined) {
-				addDeviceFs = null;
-				addDevicePath = '';
-				addDeviceLabel = '';
-				addDeviceDurability = '1';
-				await refresh();
-			}
-		});
-	}
-
-	async function removeDevice(fsName: string, devicePath: string) {
-		if (!await confirm(`Remove ${devicePath}?`, `Data will be evacuated from filesystem "${fsName}" first.`)) return;
-		await runDeviceAction(devicePath, async () => {
-			try {
-				await client.call('fs.device.remove', { filesystem: fsName, device: devicePath }, 120000);
-				toastSuccess(`Device ${devicePath} removed from "${fsName}"`);
-				await refresh();
-			} catch (e) {
-				// The safe remove was refused — typically the device still
-				// holds data/metadata bcachefs won't migrate on its own (e.g.
-				// removal would drop below the configured replicas). Rather
-				// than dead-end the user in the terminal with `--force` (#554),
-				// surface the real reason and offer a deliberately-gated force
-				// remove that the engine already supports.
-				const reason = String((e as Error)?.message ?? e).replace(/^Error:\s*/, '');
-				const forced = await confirmDangerous(
-					`Force-remove ${devicePath}?`,
-					`bcachefs refused to remove ${devicePath} safely:\n\n${reason}\n\nForce-remove pulls the device out anyway, skipping the migrate-off and redundancy checks. If the pool no longer has enough replicas on the remaining devices, this loses data. Type the device path below to confirm you understand.`,
-					devicePath
-				);
-				if (!forced) return;
-				const ok = await withToast(
-					() => client.call('fs.device.remove', { filesystem: fsName, device: devicePath, force: true }, 120000),
-					`Force-removed ${devicePath} from "${fsName}"`
-				);
-				if (ok !== undefined) await refresh();
-			}
-		});
-	}
-
-	/** Force-remove a missing/dead member by its slot index (#466/#473).
-	 * The disk is gone so nothing can be migrated off — relies on the
-	 * replicas surviving on the remaining devices. */
-	async function removeMissingDevice(fsName: string, dev: FilesystemDevice) {
-		const idx = dev.member_index;
-		if (idx == null) return;
-		if (!await confirm(
-			`Force-remove dead member (slot ${idx})?`,
-			`Removes the missing device from "${fsName}". Its data can't be migrated (the disk is gone), so this relies on the replicas still present on the remaining devices. Don't do this if the pool is already at minimum redundancy.`,
-			{ confirmLabel: 'Force remove', cancelLabel: 'Cancel' }
-		)) return;
-		await runDeviceAction(dev.path, async () => {
-			await withToast(
-				() => client.call('fs.device.remove', { filesystem: fsName, device: String(idx), force: true }, 120000),
-				`Removed dead member (slot ${idx}) from "${fsName}"`
-			);
-			await refresh();
-		});
-	}
-
-	async function evacuateDevice(fsName: string, devicePath: string) {
-		if (!await confirm(`Evacuate all data from ${devicePath}?`)) return;
-		await runDeviceAction(devicePath, async () => {
-			let started = false;
-			await withToast(
-				async () => {
-					await client.call('fs.device.evacuate', { filesystem: fsName, device: devicePath });
-					started = true;
-				},
-				`Evacuating ${devicePath} — this may take several minutes`
-			);
-			if (started) pendingEvacuation[devicePath] = Date.now();
-			await refresh();
-			startEvacuationPolling();
-		});
-	}
-
-	async function setDeviceState(fsName: string, devicePath: string, state: DeviceState) {
-		if (state === 'ro') {
-			if (!await confirm(`Set ${devicePath} read-only?`, `The device will stop accepting writes. Use Set RW to revert.`)) return;
-		}
-		await runDeviceAction(devicePath, async () => {
-			await withToast(
-				() => client.call('fs.device.set_state', { filesystem: fsName, device: devicePath, state }),
-				`Device ${devicePath} set to ${state}`
-			);
-			await refresh();
-		});
-	}
-
-	async function onlineDevice(fsName: string, devicePath: string) {
-		await runDeviceAction(devicePath, async () => {
-			await withToast(
-				() => client.call('fs.device.online', { filesystem: fsName, device: devicePath }),
-				`Device ${devicePath} online`
-			);
-			await refresh();
-		});
-	}
-
-	async function offlineDevice(fsName: string, devicePath: string) {
-		if (!await confirm(`Take ${devicePath} offline?`)) return;
-		await runDeviceAction(devicePath, async () => {
-			await withToast(
-				() => client.call('fs.device.offline', { filesystem: fsName, device: devicePath }),
-				`Device ${devicePath} offline`
-			);
-			await refresh();
-		});
-	}
-
 	function openEditOptions(fs: Filesystem) {
 		if (editOptionsFs === fs.name) {
 			editOptionsFs = null;
@@ -997,73 +441,6 @@
 		}
 		editOptionsFs = fs.name;
 		({ algo: editCompression, level: editCompressionLevel } = splitCompression(fs.options.compression));
-		({ algo: editBgCompression, level: editBgCompressionLevel } = splitCompression(fs.options.background_compression));
-		editForegroundTarget = fs.options.foreground_target ?? '';
-		editBackgroundTarget = fs.options.background_target ?? '';
-		editMetadataTarget = fs.options.metadata_target ?? '';
-		editPromoteTarget = fs.options.promote_target ?? '';
-	editErasureCode = fs.options.erasure_code ?? false;
-		editDataChecksum = fs.options.data_checksum ?? 'none';
-		editMetadataChecksum = fs.options.metadata_checksum ?? 'none';
-		editVersionUpgrade = fs.options.version_upgrade ?? '';
-		editDataReplicas = fs.options.data_replicas ?? 1;
-		editMetadataReplicas = fs.options.metadata_replicas ?? 1;
-		editMoveIos = fs.options.move_ios_in_flight ?? 32;
-		editMoveBytes = fs.options.move_bytes_in_flight ?? '';
-		editDegraded = fs.options.degraded ?? false;
-		editVerbose = fs.options.verbose ?? false;
-		editFsck = fs.options.fsck ?? false;
-		editJournalFlushDisabled = fs.options.journal_flush_disabled ?? false;
-		editJournalFlushDelay = fs.options.journal_flush_delay?.toString() ?? '';
-		showEditAdvanced = false;
-	}
-
-	async function lockFs(fs: Filesystem) {
-		// Pre-lock impact preview: ask the engine which apps/VMs/shares/
-		// backups touch this filesystem, then surface the concrete list
-		// in the confirm dialog. Failure to fetch is non-fatal — falls
-		// back to the generic warning, same as before this PR (#86).
-		let detail: string | null = null;
-		let willStop = false;
-		try {
-			const deps = await client.call<FsDependents>('fs.dependents', { name: fs.name });
-			detail = summarizeDependents(deps);
-			// Apps and VMs get actively stopped by the engine before
-			// unmount (PR-B follow-up). Shares/backups are left alone
-			// (the engine's lock_with_dependents comments explain why)
-			// — they'll error gracefully on the next access.
-			willStop = deps.apps.length > 0 || deps.vms.length > 0;
-		} catch { /* non-fatal — render the generic message */ }
-
-		let message: string;
-		if (detail && willStop) {
-			message = `Locking will stop the following apps and VMs, then unmount the filesystem and revoke its encryption key from the kernel:\n\n${detail}\n\nApps stop immediately. VMs are asked to shut down gracefully (up to 60s) before being force-killed. They will not be restarted automatically when you unlock the filesystem.\n\nContinue?`;
-		} else if (detail) {
-			message = `Locking will unmount the filesystem and revoke its encryption key from the kernel. The following will see I/O errors until you unlock and remount:\n\n${detail}\n\nContinue?`;
-		} else {
-			message = `This will unmount the filesystem and revoke the encryption key from the kernel. Any NFS, SMB, iSCSI, or NVMe-oF shares, apps, or VMs running on this filesystem will stop immediately and stay broken until you unlock it again with the passphrase.`;
-		}
-
-		const ok = await confirm(`Lock Filesystem "${fs.name}"`, message, {
-			confirmLabel: willStop ? 'Stop and Lock' : 'Lock',
-		});
-		if (!ok) return;
-		// Bumped timeout: the engine cascade can take up to ~60s if a VM
-		// drags on graceful shutdown. The default 120s already covered
-		// long unmounts; this comment is just to document expectations.
-		await withToast(
-			() => client.call('fs.lock', { name: fs.name }, 120000),
-			`Filesystem "${fs.name}" locked`,
-		);
-		await refresh();
-	}
-
-	async function doUnlock(name: string) {
-		// Imperative dialog (mounted in root layout) — same UX, but
-		// also reachable from Apps/VMs pages via the locked-FS badge.
-		if (await unlockFs(name)) {
-			await refresh();
-		}
 	}
 
 	async function saveOptions(fsName: string) {
@@ -1071,63 +448,11 @@
 			() => client.call('fs.options.update', {
 				name: fsName,
 				compression: combineCompression(editCompression, editCompressionLevel) || 'none',
-				background_compression: combineCompression(editBgCompression, editBgCompressionLevel) || 'none',
-				foreground_target: editForegroundTarget || 'none',
-				background_target: editBackgroundTarget || 'none',
-				metadata_target: editMetadataTarget || 'none',
-				promote_target: editPromoteTarget || 'none',
-				erasure_code: editErasureCode,
-				data_checksum: editDataChecksum || 'none',
-				metadata_checksum: editMetadataChecksum || 'none',
-				data_replicas: editDataReplicas,
-				metadata_replicas: editMetadataReplicas,
-				move_ios_in_flight: editMoveIos,
-				move_bytes_in_flight: editMoveBytes || undefined,
-				version_upgrade: editVersionUpgrade || undefined,
-				degraded: editDegraded || undefined,
-				verbose: editVerbose || undefined,
-				fsck: editFsck || undefined,
-				journal_flush_disabled: editJournalFlushDisabled || undefined,
-				journal_flush_delay: editJournalFlushDelay ? parseInt(editJournalFlushDelay) : undefined,
 			}, 60_000),
 			`Options updated for "${fsName}"`
 		);
 		editOptionsFs = null;
 		await refresh();
-	}
-
-	// Auto-load health data when filesystem details are expanded
-	$effect(() => {
-		const fs = expandedFs;
-		if (fs) {
-			healthFs = fs;
-			refreshHealth(fs);
-		} else {
-			healthFs = null;
-			scrubStatus = null;
-			reconcileStatus = null;
-		}
-	});
-
-	async function refreshHealth(fsName: string) {
-		healthLoading = true;
-		try {
-			[scrubStatus, reconcileStatus] = await Promise.all([
-				client.call<ScrubStatus>('fs.scrub.status', { name: fsName }),
-				client.call<ReconcileStatus>('fs.reconcile.status', { name: fsName }),
-			]);
-		} catch {
-			// Individual calls may fail
-		}
-		healthLoading = false;
-	}
-
-	async function startScrub(fsName: string) {
-		await withToast(
-			() => client.call('fs.scrub.start', { name: fsName }),
-			`Scrub started on "${fsName}"`
-		);
-		await refreshHealth(fsName);
 	}
 
 	function toggleDevice(path: string) {
@@ -1136,17 +461,21 @@
 		} else {
 			selectedPaths = [...selectedPaths, path];
 		}
-		if (selectedPaths.length <= 1) { replicas = 1; erasureCode = false; }
-		else if (erasureCode && selectedPaths.length < replicas + 1) erasureCode = false;
+		if (selectedPaths.length <= 1) replicas = 1;
+		else if (replicas > 2) replicas = 2;
+	}
+
+	function selectedDeviceObjects(): BlockDevice[] {
+		return selectedPaths
+			.map(p => devices.find(d => d.path === p))
+			.filter(Boolean) as BlockDevice[];
 	}
 
 	function availableDevices(): BlockDevice[] {
 		return devices.filter(d => !d.in_use && (showPartitions || d.dev_type !== 'part'));
 	}
 
-	// ── Compression algorithm:level helpers (#491) ──
-	// bcachefs accepts `<algo>:<level>` — a quick level on ingress
-	// (foreground) and a deeper level for background recompression.
+	// ── Compression algorithm:level helpers ──
 	// Only zstd and gzip have a level knob; lz4 doesn't.
 	function compressionMaxLevel(algo: string): number | null {
 		return algo === 'zstd' ? 22 : algo === 'gzip' ? 9 : null;
@@ -1163,83 +492,14 @@
 		return level && compressionMaxLevel(algo) !== null ? `${algo}:${level}` : algo;
 	}
 
-	/** Distinct device labels in a filesystem — the candidate tiering
-	 * targets for foreground/background/metadata/promote (#434). */
-	function deviceLabels(fs: Filesystem): string[] {
-		return [...new Set(fs.devices.map((d) => d.label).filter((l): l is string => !!l))].sort();
+	function deviceBlock(path: string): BlockDevice | undefined {
+		return devices.find((d) => d.path === path);
 	}
-
-	/** Targetable labels for the data-target dropdowns (#507). bcachefs
-	 * labels are hierarchical: a device labeled `hdd.spinner1` belongs to
-	 * group `hdd`, and a data target can point at the whole group or the
-	 * leaf. We surface every prefix of every device label so the operator
-	 * can target a tier (`hdd`, `ssd`) — covering "all the spinners" in
-	 * one pick — not just one device at a time. `group` = the label has
-	 * descendants; `count` = devices it covers. */
-	function targetOptions(fs: Filesystem): { value: string; group: boolean; count: number }[] {
-		const labels = fs.devices.map((d) => d.label).filter((l): l is string => !!l);
-		const prefixes = new Set<string>();
-		for (const label of labels) {
-			const parts = label.split('.');
-			for (let i = 1; i <= parts.length; i++) prefixes.add(parts.slice(0, i).join('.'));
-		}
-		return [...prefixes].sort().map((value) => {
-			const members = labels.filter((l) => l === value || l.startsWith(value + '.'));
-			return { value, group: members.some((l) => l !== value), count: members.length };
-		});
-	}
-
-	function availableDevicesForAdd(): BlockDevice[] {
-		return devices.filter(d => !d.in_use && (showAddPartitions || d.dev_type !== 'part'));
-	}
-
-	/** Classify an Add Device candidate against the target pool (#472).
-	 * A bcachefs disk whose superblock UUID matches this filesystem is
-	 * either an offline member (re-attach it — wiping would destroy a
-	 * disk that could just be brought back online) or a former, removed
-	 * member (its data was evacuated; wipe is the correct path). Other
-	 * bcachefs disks belong to a foreign pool. */
-	function addCandidateKind(dev: BlockDevice, fs: Filesystem): 'plain' | 'offline_member' | 'former_member' | 'foreign' {
-		if (dev.fs_type !== 'bcachefs') return 'plain';
-		if (dev.fs_uuid && dev.fs_uuid === fs.uuid) {
-			return fs.devices.some(d => d.missing) ? 'offline_member' : 'former_member';
-		}
-		return 'foreign';
-	}
-
-	/** Device path to hand fs.device.online to re-attach this missing
-	 * member (#472): its own path when that disk is currently detected
-	 * (e.g. it was offlined in place), else any available disk whose
-	 * superblock UUID matches this pool — the member may have reappeared
-	 * under a new kernel name. Null when no matching disk is present. */
-	function reattachPath(fs: Filesystem, dev: FilesystemDevice): string | null {
-		if (deviceBlock(dev.path)) return dev.path;
-		const cand = devices.find(d => !d.in_use && d.fs_uuid && d.fs_uuid === fs.uuid);
-		return cand?.path ?? null;
-	}
-
-	/** SMART health for a candidate disk, matched by path (whole-disk
-	 * only; partitions inherit nothing). `undefined` when smartctl has
-	 * no data — virtual disks, USB bridges, or SMART service disabled. */
-	function smartFor(path: string): DiskHealth | undefined {
-		return diskHealth.find(d => d.device === path);
-	}
-
-	function devDisplayState(dev: FilesystemDevice): string | null {
-		// Show the device's actual bcachefs state (rw/ro/failed/spare/
-		// evacuating). We used to synthesize an "evacuated" badge when
-		// `has_data` parsed empty, but that lied: a still-evacuating disk
-		// flipped to "evacuated" the moment the (fragile) has_data parse
-		// came back empty, and could land on the wrong row. There's no
-		// real "evacuated" device state — once a device is drained the
-		// operator removes it and it disappears from the list. (#456)
-		//
-		// One exception: a just-started evacuation may not be visible in
-		// dev.state yet (bcachefs persists it asynchronously). Show it
-		// optimistically until refresh() confirms or expires the marker,
-		// so the row doesn't re-offer Evacuate in the gap. (#479)
-		if (pendingEvacuation[dev.path] && dev.state !== 'evacuating') return 'evacuating';
-		return dev.state;
+	/** Total IO errors across read/write/checksum, or null if unknown (unmounted). */
+	function devErrorTotal(dev: FilesystemDevice): number | null {
+		if (dev.read_errors == null && dev.write_errors == null && dev.checksum_errors == null)
+			return null;
+		return (dev.read_errors ?? 0) + (dev.write_errors ?? 0) + (dev.checksum_errors ?? 0);
 	}
 
 	function stateColor(state: string | null): string {
@@ -1248,16 +508,58 @@
 			case 'ro': return 'bg-blue-950 text-blue-400';
 			case 'failed': return 'bg-red-950 text-red-400';
 			case 'spare': return 'bg-amber-950 text-amber-400';
-			case 'evacuating': return 'bg-yellow-950 text-yellow-400 animate-pulse';
 			default: return 'bg-secondary text-muted-foreground';
 		}
 	}
 
-	// ── Filesystem device table: user-selectable columns (#457) ──
-	// Device / Label / State / Actions are always shown; these are
-	// optional and persisted per-browser. Size/Type/Model/Serial join
-	// the BlockDevice list (device.list); Clean + error counts come from
-	// the per-device bcachefs IO error counters.
+	type DevSortKey =
+		| 'path' | 'label' | 'state' | 'slot' | 'uuid' | 'size' | 'type'
+		| 'rotational' | 'model' | 'serial' | 'clean'
+		| 'read_err' | 'write_err' | 'csum_err' | 'data_allowed' | 'has_data';
+	let devSortKey = $state<DevSortKey>('slot');
+	let devSortDir = $state<'asc' | 'desc'>('asc');
+	function toggleDevSort(key: DevSortKey) {
+		if (devSortKey === key) devSortDir = devSortDir === 'asc' ? 'desc' : 'asc';
+		else { devSortKey = key; devSortDir = 'asc'; }
+	}
+	function devSortVal(dev: FilesystemDevice, key: DevSortKey): string | number {
+		switch (key) {
+			case 'path': return dev.path ?? '';
+			case 'label': return dev.label ?? '';
+			case 'state': return dev.missing ? 'missing' : (dev.state ?? '');
+			case 'slot': return dev.member_index ?? -1;
+			case 'uuid': return dev.uuid ?? '';
+			case 'size': return deviceBlock(dev.path)?.size_bytes ?? -1;
+			case 'type': return deviceBlock(dev.path)?.device_class ?? '';
+			case 'rotational': return dev.rotational == null ? -1 : (dev.rotational ? 1 : 0);
+			case 'model': return deviceBlock(dev.path)?.model ?? '';
+			case 'serial': return deviceBlock(dev.path)?.serial ?? '';
+			case 'clean': return devErrorTotal(dev) ?? -1;
+			case 'read_err': return dev.read_errors ?? -1;
+			case 'write_err': return dev.write_errors ?? -1;
+			case 'csum_err': return dev.checksum_errors ?? -1;
+			case 'data_allowed': return dev.data_allowed ?? '';
+			case 'has_data': return dev.has_data ?? '';
+		}
+	}
+	function sortedDevices(devs: FilesystemDevice[]): FilesystemDevice[] {
+		const sign = devSortDir === 'asc' ? 1 : -1;
+		return [...devs].sort((a, b) => {
+			const av = devSortVal(a, devSortKey);
+			const bv = devSortVal(b, devSortKey);
+			let cmp =
+				typeof av === 'number' && typeof bv === 'number'
+					? av - bv
+					: String(av).localeCompare(String(bv), undefined, { numeric: true });
+			if (cmp === 0) cmp = (a.path ?? '').localeCompare(b.path ?? '', undefined, { numeric: true });
+			return sign * cmp;
+		});
+	}
+
+	// ── Filesystem device table: user-selectable columns ──
+	// Device / Label / State are always shown; these are optional and
+	// persisted per-browser. Size/Type/Model/Serial join device.list;
+	// Clean + error counts come from per-device IO error counters.
 	const DEVICE_COLUMNS = [
 		{ id: 'slot', label: 'Slot' },
 		{ id: 'uuid', label: 'UUID' },
@@ -1284,65 +586,6 @@
 			? visibleDeviceCols.filter((c) => c !== id)
 			: [...visibleDeviceCols, id];
 		try { localStorage.setItem('fsDeviceCols', JSON.stringify(visibleDeviceCols)); } catch { /* ignore */ }
-	}
-
-	/** The BlockDevice (device.list) backing a filesystem member, by path. */
-	function deviceBlock(path: string): BlockDevice | undefined {
-		return devices.find((d) => d.path === path);
-	}
-	/** Total IO errors across read/write/checksum, or null if unknown (unmounted). */
-	function devErrorTotal(dev: FilesystemDevice): number | null {
-		if (dev.read_errors == null && dev.write_errors == null && dev.checksum_errors == null)
-			return null;
-		return (dev.read_errors ?? 0) + (dev.write_errors ?? 0) + (dev.checksum_errors ?? 0);
-	}
-
-	// ── Device-table column sorting (#531) ──────────────────────────────
-	// One shared sort key applies to every filesystem's device table.
-	type DevSortKey =
-		| 'path' | 'label' | 'state' | 'slot' | 'uuid' | 'size' | 'type'
-		| 'rotational' | 'model' | 'serial' | 'clean'
-		| 'read_err' | 'write_err' | 'csum_err' | 'data_allowed' | 'has_data';
-	let devSortKey = $state<DevSortKey>('slot');
-	let devSortDir = $state<'asc' | 'desc'>('asc');
-	function toggleDevSort(key: DevSortKey) {
-		if (devSortKey === key) devSortDir = devSortDir === 'asc' ? 'desc' : 'asc';
-		else { devSortKey = key; devSortDir = 'asc'; }
-	}
-	/** Comparable value for a device under the given sort key (number or string). */
-	function devSortVal(dev: FilesystemDevice, key: DevSortKey): string | number {
-		switch (key) {
-			case 'path': return dev.path ?? '';
-			case 'label': return dev.label ?? '';
-			case 'state': return dev.missing ? 'missing' : (devDisplayState(dev) ?? '');
-			case 'slot': return dev.member_index ?? -1;
-			case 'uuid': return dev.uuid ?? '';
-			case 'size': return deviceBlock(dev.path)?.size_bytes ?? -1;
-			case 'type': return deviceBlock(dev.path)?.device_class ?? '';
-			case 'rotational': return dev.rotational == null ? -1 : (dev.rotational ? 1 : 0);
-			case 'model': return deviceBlock(dev.path)?.model ?? '';
-			case 'serial': return deviceBlock(dev.path)?.serial ?? '';
-			case 'clean': return devErrorTotal(dev) ?? -1;
-			case 'read_err': return dev.read_errors ?? -1;
-			case 'write_err': return dev.write_errors ?? -1;
-			case 'csum_err': return dev.checksum_errors ?? -1;
-			case 'data_allowed': return dev.data_allowed ?? '';
-			case 'has_data': return dev.has_data ?? '';
-		}
-	}
-	/** A sorted copy of a filesystem's devices under the current key/dir. */
-	function sortedDevices(devs: FilesystemDevice[]): FilesystemDevice[] {
-		const sign = devSortDir === 'asc' ? 1 : -1;
-		return [...devs].sort((a, b) => {
-			const av = devSortVal(a, devSortKey);
-			const bv = devSortVal(b, devSortKey);
-			let cmp =
-				typeof av === 'number' && typeof bv === 'number'
-					? av - bv
-					: String(av).localeCompare(String(bv), undefined, { numeric: true });
-			if (cmp === 0) cmp = (a.path ?? '').localeCompare(b.path ?? '', undefined, { numeric: true });
-			return sign * cmp;
-		});
 	}
 
 	function classColor(cls: string): string {
@@ -1400,7 +643,7 @@
 		<CardContent class="pt-6">
 			<!-- Step indicator -->
 			<div class="mb-6 flex items-center gap-0">
-				{#each [['1', 'Devices'], ['2', 'Tiering'], ['3', 'Review']] as [num, label], i}
+				{#each [['1', 'Devices'], ['2', 'Review']] as [num, label], i}
 					<div class="flex items-center">
 						<div class="flex items-center gap-2">
 							<div class="flex h-6 w-6 items-center justify-center rounded-full text-xs font-semibold
@@ -1411,7 +654,7 @@
 							</div>
 							<span class="text-xs {wizardStep === i + 1 ? 'text-foreground font-medium' : 'text-muted-foreground'}">{label}</span>
 						</div>
-						{#if i < 2}
+						{#if i < 1}
 							<div class="mx-3 h-px w-8 bg-border"></div>
 						{/if}
 					</div>
@@ -1439,7 +682,7 @@
 						</div>
 					</div>
 					{#if availableDevices().length === 0}
-						<p class="text-sm text-muted-foreground">No available devices. You may need to wipe or prepare disks first.</p>
+						<p class="text-sm text-muted-foreground">No available devices. Reclaim disks held by old RAID/LVM on the Disks page (Wipe/Reclaim), then try again.</p>
 						<Button size="sm" class="mt-2" onclick={() => goto('/disks')}>Disks</Button>
 					{:else}
 						<div class="space-y-1.5">
@@ -1512,159 +755,12 @@
 				</div>
 				<div class="flex gap-2">
 					<Button size="sm" onclick={wizardNext} disabled={!newName || selectedPaths.length === 0}>
-						Next: Choose Tiering →
+						Next: Review →
 					</Button>
 				</div>
 
-			<!-- Step 2: Tiering Profile -->
+			<!-- Step 2: Review + Options -->
 			{:else if wizardStep === 2}
-				{@const profiles = buildProfiles()}
-				<div class="mb-4 space-y-3">
-					{#each profiles as profile}
-						<button
-							disabled={!profile.available}
-							onclick={() => { if (profile.available) wizardProfile = profile.id; }}
-							class="w-full rounded-lg border-2 px-4 py-3 text-left transition-colors
-								{!profile.available ? 'cursor-not-allowed border-border opacity-40' :
-								 wizardProfile === profile.id ? 'border-primary bg-primary/5' :
-								 'border-border hover:border-primary/50 hover:bg-secondary/30'}">
-							<div class="flex items-center justify-between">
-								<div class="flex items-center gap-2">
-									<div class="h-4 w-4 rounded-full border-2 flex items-center justify-center
-										{wizardProfile === profile.id && profile.available ? 'border-primary' : 'border-muted-foreground'}">
-										{#if wizardProfile === profile.id && profile.available}
-											<div class="h-2 w-2 rounded-full bg-primary"></div>
-										{/if}
-									</div>
-									<span class="font-semibold text-sm">{profile.name}</span>
-									{#if profile.recommended && profile.available}
-										<span class="rounded bg-primary/20 px-1.5 py-0.5 text-[10px] font-semibold text-primary uppercase">recommended</span>
-									{/if}
-								</div>
-							</div>
-							<p class="mt-1 ml-6 text-xs text-muted-foreground">{profile.tagline}</p>
-							{#if wizardProfile === profile.id && profile.available}
-								<p class="mt-2 ml-6 text-xs text-foreground/80">{profile.description}</p>
-								<!-- Tier diagram -->
-								<div class="mt-3 ml-6">
-									{#if profile.id === 'single'}
-										<div class="flex flex-wrap gap-2">
-											{#each selectedDeviceObjects() as dev}
-												<div class="flex items-center gap-1.5 rounded border border-border px-2 py-1">
-													<span class="rounded px-1 py-0.5 text-[10px] font-semibold uppercase {classColor(dev.device_class)}">{dev.device_class}</span>
-													<span class="font-mono text-[10px] text-muted-foreground">{dev.path}</span>
-												</div>
-											{/each}
-										</div>
-									{:else if profile.id === 'write_cache'}
-										<div class="flex items-start gap-6">
-											<div>
-												<div class="mb-1 text-[10px] text-muted-foreground uppercase tracking-wide">Fast (writes + metadata)</div>
-												<div class="flex flex-col gap-1">
-													{#each selectedDeviceObjects().filter(d => d.device_class !== 'hdd') as dev}
-														<div class="flex items-center gap-1.5 rounded border border-blue-800/50 bg-blue-950/30 px-2 py-1">
-															<span class="rounded px-1 py-0.5 text-[10px] font-semibold uppercase {classColor(dev.device_class)}">{dev.device_class}</span>
-															<span class="font-mono text-[10px] text-muted-foreground">{dev.path}</span>
-														</div>
-													{/each}
-												</div>
-											</div>
-											<div class="mt-4 text-muted-foreground">→</div>
-											<div>
-												<div class="mb-1 text-[10px] text-muted-foreground uppercase tracking-wide">Slow (cold data)</div>
-												<div class="flex flex-col gap-1">
-													{#each selectedDeviceObjects().filter(d => d.device_class === 'hdd') as dev}
-														<div class="flex items-center gap-1.5 rounded border border-amber-800/50 bg-amber-950/30 px-2 py-1">
-															<span class="rounded px-1 py-0.5 text-[10px] font-semibold uppercase {classColor(dev.device_class)}">{dev.device_class}</span>
-															<span class="font-mono text-[10px] text-muted-foreground">{dev.path}</span>
-														</div>
-													{/each}
-												</div>
-											</div>
-										</div>
-									{:else if profile.id === 'full_tiering'}
-										<div class="flex items-start gap-4">
-											{#each [['nvme', 'Writes + Metadata', 'border-violet-800/50 bg-violet-950/30'],
-											         ['ssd', 'Read Cache', 'border-blue-800/50 bg-blue-950/30'],
-											         ['hdd', 'Cold Storage', 'border-amber-800/50 bg-amber-950/30']] as [cls, role, colors]}
-												{@const devs = selectedDeviceObjects().filter(d => d.device_class === cls)}
-												{#if devs.length > 0}
-													<div>
-														<div class="mb-1 text-[10px] text-muted-foreground uppercase tracking-wide">{role}</div>
-														<div class="flex flex-col gap-1">
-															{#each devs as dev}
-																<div class="flex items-center gap-1.5 rounded border {colors} px-2 py-1">
-																	<span class="rounded px-1 py-0.5 text-[10px] font-semibold uppercase {classColor(cls)}">{cls}</span>
-																	<span class="font-mono text-[10px] text-muted-foreground">{dev.path}</span>
-																</div>
-															{/each}
-														</div>
-													</div>
-												{/if}
-											{/each}
-										</div>
-									{:else if profile.id === 'none'}
-									<div class="flex flex-wrap gap-2">
-										{#each selectedDeviceObjects() as dev}
-											<div class="flex items-center gap-1.5 rounded border border-border px-2 py-1">
-												<span class="rounded px-1 py-0.5 text-[10px] font-semibold uppercase {classColor(dev.device_class)}">{dev.device_class}</span>
-												<span class="font-mono text-[10px] text-muted-foreground">{dev.path}</span>
-											</div>
-										{/each}
-									</div>
-								{:else if profile.id === 'manual'}
-									<div class="space-y-3">
-										<div>
-											<div class="mb-1.5 text-[10px] uppercase tracking-wide text-muted-foreground">Device Labels</div>
-											<div class="space-y-1.5">
-												{#each selectedDeviceObjects() as dev}
-													<div class="flex items-center gap-2">
-														<span class="rounded px-1 py-0.5 text-[10px] font-semibold uppercase {classColor(dev.device_class)}">{dev.device_class}</span>
-														<span class="w-28 font-mono text-[10px] text-muted-foreground shrink-0">{dev.path}</span>
-														<input
-															type="text"
-															value={manualLabels[dev.path] ?? ''}
-															oninput={(e) => { manualLabels = { ...manualLabels, [dev.path]: (e.target as HTMLInputElement).value }; }}
-															placeholder="label (e.g. fast, slow)"
-															class="h-7 flex-1 rounded border border-input bg-transparent px-2 text-xs"
-														/>
-													</div>
-												{/each}
-											</div>
-										</div>
-										<div class="grid grid-cols-2 gap-2">
-											<div>
-												<div class="mb-1 text-[10px] uppercase tracking-wide text-muted-foreground">Foreground Target</div>
-												<input type="text" bind:value={manualFgTarget} placeholder="label or empty" class="h-7 w-full rounded border border-input bg-transparent px-2 text-xs" />
-											</div>
-											<div>
-												<div class="mb-1 text-[10px] uppercase tracking-wide text-muted-foreground">Metadata Target</div>
-												<input type="text" bind:value={manualMetaTarget} placeholder="label or empty" class="h-7 w-full rounded border border-input bg-transparent px-2 text-xs" />
-											</div>
-											<div>
-												<div class="mb-1 text-[10px] uppercase tracking-wide text-muted-foreground">Background Target</div>
-												<input type="text" bind:value={manualBgTarget} placeholder="label or empty" class="h-7 w-full rounded border border-input bg-transparent px-2 text-xs" />
-											</div>
-											<div>
-												<div class="mb-1 text-[10px] uppercase tracking-wide text-muted-foreground">Promote Target</div>
-												<input type="text" bind:value={manualPromoteTarget} placeholder="label or empty" class="h-7 w-full rounded border border-input bg-transparent px-2 text-xs" />
-											</div>
-										</div>
-									</div>
-								{/if}
-								</div>
-							{/if}
-						</button>
-					{/each}
-				</div>
-				<div class="flex gap-2">
-					<Button variant="secondary" size="sm" onclick={() => wizardStep = 1}>← Back</Button>
-					<Button size="sm" onclick={wizardNext}>Next: Review →</Button>
-				</div>
-
-			<!-- Step 3: Review + Options -->
-			{:else if wizardStep === 3}
-				{@const profile = activeProfile()}
 				<div class="mb-5 grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-sm">
 					<span class="text-muted-foreground">Name</span>
 					<span class="font-mono">{newName}</span>
@@ -1679,45 +775,21 @@
 									<span class="rounded px-1 py-0.5 text-[10px] font-semibold uppercase {classColor(dev.device_class)}">{dev.device_class}</span>
 									<span class="font-mono">{dev.path}</span>
 								{/if}
-								{#if profile.device_labels[dev.path]}
-									<span class="text-muted-foreground">→ {profile.device_labels[dev.path]}</span>
-								{/if}
 							</span>
 						{/each}
 					</div>
-					<span class="text-muted-foreground">Tiering</span>
-					<span>{profile.name}</span>
-					{#if profile.foreground_target}
-						<span class="text-muted-foreground">Foreground Target</span><span>{profile.foreground_target}</span>
-					{/if}
-					{#if profile.metadata_target}
-						<span class="text-muted-foreground">Metadata Target</span><span>{profile.metadata_target}</span>
-					{/if}
-					{#if profile.background_target}
-						<span class="text-muted-foreground">Background Target</span><span>{profile.background_target}</span>
-					{/if}
-					{#if profile.promote_target}
-						<span class="text-muted-foreground">Promote Target</span><span>{profile.promote_target}</span>
-					{/if}
-					</div>
+				</div>
 
 				<div class="mb-5 grid grid-cols-2 gap-4">
 					<div>
-						<Label for="replicas">Replicas</Label>
-						<select id="replicas" bind:value={replicas} disabled={selectedPaths.length <= 1 || erasureCode}
+						<Label for="replicas">Data profile</Label>
+						<select id="replicas" bind:value={replicas} disabled={selectedPaths.length <= 1}
 							class="mt-1 h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm">
-							{#if !erasureCode}
-								<option value={1}>1 (no redundancy)</option>
-							{/if}
-							<option value={2}>2{erasureCode ? ' (RAID-5)' : ' (mirrored)'}</option>
-							{#if selectedPaths.length >= 4 || !erasureCode}
-								<option value={3}>3{erasureCode ? ' (RAID-6)' : ''}</option>
-							{/if}
+							<option value={1}>single (no redundancy)</option>
+							<option value={2}>raid1 (mirrored)</option>
 						</select>
 						{#if selectedPaths.length <= 1}
-							<span class="text-xs text-muted-foreground">Requires multiple devices</span>
-						{:else if erasureCode}
-							<span class="text-xs text-muted-foreground">Set by erasure coding</span>
+							<span class="text-xs text-muted-foreground">raid1 requires multiple devices</span>
 						{/if}
 					</div>
 					<div>
@@ -1742,26 +814,6 @@
 					</div>
 				</div>
 
-				{#if selectedPaths.length >= 3}
-				<div class="mb-5">
-					<label class="flex cursor-pointer items-center gap-2 text-sm">
-						<input type="checkbox" bind:checked={erasureCode} disabled={selectedPaths.length < 3} class="h-4 w-4" />
-						<span class="font-medium">Erasure Coding</span>
-						{#if erasureCode}
-							<span class="text-xs text-amber-400">({replicas === 2 ? 'RAID-5' : 'RAID-6'}, {replicas}+1 across {selectedPaths.length} devices)</span>
-						{:else}
-							<span class="text-xs text-muted-foreground">(Reed-Solomon parity, requires 3+ devices)</span>
-						{/if}
-					</label>
-					{#if erasureCode}
-						<p class="mt-1 ml-6 text-xs text-muted-foreground">Data is written as {replicas} replicas, then converted to parity stripes in the background. Needs {replicas + 1}+ devices.</p>
-						{#if selectedPaths.length < replicas + 1}
-							<p class="mt-1 ml-6 text-xs text-destructive">Not enough devices: need at least {replicas + 1} for {replicas === 2 ? 'RAID-5' : 'RAID-6'} (have {selectedPaths.length}).</p>
-						{/if}
-					{/if}
-				</div>
-				{/if}
-
 				{#if selectedPaths.length > 0}
 					{@const rawTotal = selectedDeviceObjects().reduce(
 						(sum, d) => sum + d.size_bytes,
@@ -1772,7 +824,7 @@
 						fsCapacity,
 						selectedPaths.length,
 						replicas,
-						erasureCode
+						false
 					)}
 					<div class="mb-5 rounded-lg border border-border bg-secondary/20 p-4 text-sm">
 						<div class="mb-2 flex items-center gap-2">
@@ -1782,175 +834,24 @@
 						<div class="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-xs">
 							<span class="text-muted-foreground">Raw selected</span>
 							<span class="font-mono">{formatBytes(rawTotal)} across {selectedPaths.length} device{selectedPaths.length === 1 ? '' : 's'}</span>
-							<span class="text-muted-foreground">After bcachefs overhead</span>
-							<span class="font-mono">~{formatBytes(fsCapacity)} <span class="text-muted-foreground">(metadata, journal, gc reserve)</span></span>
+							<span class="text-muted-foreground">After filesystem overhead</span>
+							<span class="font-mono">~{formatBytes(fsCapacity)}</span>
 							<span class="text-muted-foreground">Layout</span>
 							<span>
-								{#if erasureCode}
-									Erasure code · {replicas === 2 ? 'RAID-5' : 'RAID-6'} ({replicas - 1} parity per stripe)
-								{:else if replicas === 1}
-									No redundancy
+								{#if replicas === 1}
+									No redundancy (single)
 								{:else}
-									{replicas}× mirror
+									raid1 mirror
 								{/if}
 							</span>
 							<span class="text-muted-foreground">Estimated usable</span>
 							<span class="font-mono font-semibold">~{formatBytes(usable)}</span>
 						</div>
 						<p class="mt-2 text-[11px] text-muted-foreground/80">
-							Overhead varies a couple of points by filesystem size and bcachefs version. Subvolumes can also override replica counts per file, so this is a rough number for the simple-case configuration.
+							Rough estimate for a fresh btrfs filesystem; actual usable space varies with metadata and profile.
 						</p>
 					</div>
 				{/if}
-
-				<!-- Encryption -->
-				<div class="mb-5 rounded-lg border border-border p-4">
-					<label class="flex cursor-pointer items-center gap-2 text-sm font-medium">
-						<input type="checkbox" bind:checked={encryption} class="h-4 w-4" />
-						Encrypt filesystem
-					</label>
-					{#if encryption}
-						<div class="mt-3 grid grid-cols-2 gap-4">
-							<div>
-								<Label for="passphrase">Passphrase</Label>
-								<input id="passphrase" type="password" bind:value={passphrase}
-									class="mt-1 h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm"
-									placeholder="Enter passphrase" />
-							</div>
-							<div>
-								<Label for="passphrase-confirm">Confirm</Label>
-								<input id="passphrase-confirm" type="password" bind:value={passphraseConfirm}
-									class="mt-1 h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm"
-									placeholder="Confirm passphrase" />
-							</div>
-						</div>
-						{#if passphrase && passphraseConfirm && passphrase !== passphraseConfirm}
-							<p class="mt-1 text-xs text-destructive">Passphrases do not match.</p>
-						{/if}
-						<label class="mt-3 flex cursor-pointer items-center gap-2 text-sm">
-							<input type="checkbox" bind:checked={storeKey} class="h-4 w-4" />
-							Store key for auto-unlock on boot
-						</label>
-						<p class="mt-1 text-xs text-muted-foreground">
-							{#if storeKey}
-								Key stored on boot drive. Filesystem auto-unlocks on boot. Protects data at rest against drive theft.
-							{:else}
-								Passphrase required after every reboot via WebUI. More secure but requires manual intervention.
-							{/if}
-						</p>
-						<p class="mt-2 text-xs text-amber-400">Warning: losing the passphrase with no stored key means permanent data loss.</p>
-						{#if hostTpmAvailable && storeKey}
-							<label class="mt-3 flex cursor-pointer items-center gap-2 text-sm">
-								<input type="checkbox" bind:checked={bindToTpm} class="h-4 w-4" />
-								Seal key to TPM2 (PCR-7 bound)
-							</label>
-							<p class="mt-1 text-xs text-muted-foreground">
-								{#if bindToTpm}
-									Key is sealed to this host's TPM right after creation. Auto-unlock on boot prefers the sealed copy; the plaintext key file stays as a recovery fallback (remove later via Export Key → Destroy Key if you want pure TPM-only).
-								{:else}
-									Key stays plaintext on the boot drive. You can still bind it to the TPM later via the row's "Bind to TPM" button on the Filesystems page.
-								{/if}
-							</p>
-						{/if}
-					{:else}
-						<p class="mt-1 text-xs text-muted-foreground">Data at rest will not be encrypted.</p>
-					{/if}
-				</div>
-
-				<!-- Advanced format options -->
-				<div class="mb-5">
-					<button
-						type="button"
-						onclick={() => showCreateAdvanced = !showCreateAdvanced}
-						class="flex items-center gap-1 text-sm font-medium text-muted-foreground hover:text-foreground"
-					>
-						<span class="inline-block w-3 text-xs">{showCreateAdvanced ? '▾' : '▸'}</span>
-						Advanced format options
-					</button>
-				{#if showCreateAdvanced}
-					<p class="mt-2 text-xs text-amber-400">Defaults are recommended for most setups. Only change these if you understand their impact.</p>
-					<div class="mt-3 flex flex-wrap gap-4">
-						<div class="flex-1 min-w-[140px]">
-							<Label for="version-upgrade">Version Upgrade</Label>
-							<select id="version-upgrade" bind:value={versionUpgrade}
-								class="mt-1 h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm">
-								<option value="">None (don't upgrade)</option>
-								<option value="compatible">Compatible</option>
-								<option value="incompatible">Incompatible (latest)</option>
-							</select>
-						</div>
-						<div class="flex-1 min-w-[140px]">
-							<Label for="data-checksum">Data Checksum</Label>
-							<select id="data-checksum" bind:value={dataChecksum}
-								class="mt-1 h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm">
-								<option value="">Default (crc32c)</option>
-								<option value="crc32c">CRC32C</option>
-								<option value="crc64">CRC64</option>
-								<option value="xxhash">xxHash</option>
-								<option value="none">None</option>
-							</select>
-						</div>
-						<div class="flex-1 min-w-[140px]">
-							<Label for="meta-checksum">Metadata Checksum</Label>
-							<select id="meta-checksum" bind:value={metadataChecksum}
-								class="mt-1 h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm">
-								<option value="">Default (crc32c)</option>
-								<option value="crc32c">CRC32C</option>
-								<option value="crc64">CRC64</option>
-								<option value="xxhash">xxHash</option>
-								<option value="none">None</option>
-							</select>
-						</div>
-						<div class="flex-1 min-w-[140px]">
-							<Label for="bucket-size">Bucket Size</Label>
-							<select id="bucket-size" bind:value={bucketSize}
-								class="mt-1 h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm">
-								<option value="">Default</option>
-								<option value="256k">256 KiB</option>
-								<option value="512k">512 KiB</option>
-								<option value="1M">1 MiB</option>
-								<option value="2M">2 MiB</option>
-							</select>
-						</div>
-						<div class="flex-1 min-w-[140px]">
-							<Label for="extent-max">Max Encoded Extent</Label>
-							<select id="extent-max" bind:value={encodedExtentMax}
-								class="mt-1 h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm">
-								<option value="">Default</option>
-								<option value="64k">64 KiB</option>
-								<option value="128k">128 KiB</option>
-								<option value="256k">256 KiB</option>
-								<option value="512k">512 KiB</option>
-							</select>
-						</div>
-					</div>
-					<div class="mt-3 flex flex-wrap gap-4">
-						<label class="flex cursor-pointer items-center gap-2 text-sm">
-							<input type="checkbox" bind:checked={degraded} class="h-4 w-4" />
-							Degraded mode
-						</label>
-						<label class="flex cursor-pointer items-center gap-2 text-sm">
-							<input type="checkbox" bind:checked={mountFsck} class="h-4 w-4" />
-							Fsck on mount
-						</label>
-						<label class="flex cursor-pointer items-center gap-2 text-sm">
-							<input type="checkbox" bind:checked={verbose} class="h-4 w-4" />
-							Verbose
-						</label>
-						<label class="flex cursor-pointer items-center gap-2 text-sm">
-							<input type="checkbox" bind:checked={journalFlushDisabled} class="h-4 w-4" />
-							Disable journal flush
-						</label>
-					</div>
-					<div class="mt-3 max-w-xs">
-						<div>
-							<Label class="text-xs">Journal flush delay (µs)</Label>
-							<Input type="number" bind:value={journalFlushDelay} placeholder="1000" class="mt-1 h-8 text-xs" />
-						</div>
-					</div>
-					<p class="mt-2 text-xs text-muted-foreground">Checksum and bucket size are set at format time. Mount options can be changed later via Edit Options.</p>
-				{/if}
-				</div>
 
 				<div class="mb-5">
 					<button
@@ -1969,8 +870,8 @@
 				</div>
 
 				<div class="flex gap-2">
-					<Button variant="secondary" size="sm" onclick={() => wizardStep = 2}>← Back</Button>
-					<Button size="sm" onclick={createFs} disabled={(erasureCode && selectedPaths.length < replicas + 1) || (encryption && (!passphrase || passphrase !== passphraseConfirm))}>Create Filesystem</Button>
+					<Button variant="secondary" size="sm" onclick={() => wizardStep = 1}>← Back</Button>
+					<Button size="sm" onclick={createFs} disabled={replicas === 2 && selectedPaths.length < 2}>Create Filesystem</Button>
 				</div>
 			{/if}
 		</CardContent>
@@ -2043,7 +944,7 @@
 						onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') expandedFs = expandedFs === fs.name ? null : fs.name; }}>
 						<strong class="text-lg">{fs.name}</strong>
 						<Badge variant={fs.mounted ? 'default' : 'destructive'}>
-							{fs.mounted ? 'Mounted' : fs.options.locked ? 'Locked' : 'Unmounted'}
+							{fs.mounted ? 'Mounted' : 'Unmounted'}
 						</Badge>
 						{#if fs.mounted && fs.mount_point}
 							<span class="font-mono text-xs text-muted-foreground">{fs.mount_point}</span>
@@ -2058,49 +959,10 @@
 								{editOptionsFs === fs.name ? 'Hide Options' : 'Options'}
 							</Button>
 						{/if}
-						{#if fs.options.encrypted && fs.options.locked}
-							<Button variant="default" size="xs" onclick={() => doUnlock(fs.name)}>
-								Unlock
-							</Button>
-						{:else if fs.options.encrypted}
-							<Button variant="secondary" size="xs" onclick={() => lockFs(fs)}>
-								Lock
-							</Button>
-						{/if}
 						<Button variant="secondary" size="xs" onclick={() => toggleMount(fs)}
-							disabled={mountingFs === fs.name || (fs.options.encrypted && fs.options.locked && !fs.mounted)}>
+							disabled={mountingFs === fs.name}>
 							{mountingFs === fs.name ? (fs.mounted ? 'Unmounting...' : 'Mounting...') : (fs.mounted ? 'Unmount' : 'Mount')}
 						</Button>
-						{#if fs.options.encrypted && fs.options.key_stored}
-							<Button variant="secondary" size="xs" onclick={async () => {
-								const key = await client.call<string>('fs.key.export', { name: fs.name });
-								const blob = new Blob([key], { type: 'text/plain' });
-								const a = document.createElement('a');
-								a.href = URL.createObjectURL(blob);
-								a.download = `${fs.name}.key`;
-								a.click();
-							}}>
-								Export Key
-							</Button>
-						{/if}
-						{#if fs.options.encrypted && tpmStatus[fs.name]?.tpm_available}
-							{#if tpmStatus[fs.name].bound}
-								<Button variant="secondary" size="xs" onclick={() => unbindTpm(fs)}>
-									Unbind TPM
-								</Button>
-							{:else}
-								<Button
-									variant="secondary"
-									size="xs"
-									onclick={() => bindTpm(fs)}
-									disabled={!fs.options.key_stored}
-									title={fs.options.key_stored
-										? 'Seal the stored encryption key with this host\'s TPM2 (PCR-7 bound).'
-										: 'No stored key — binding to TPM requires a key file. Recreate the filesystem with “store key” enabled or restore the key first.'}>
-									Bind to TPM
-								</Button>
-							{/if}
-						{/if}
 						{#if fs.mounted}
 							{@const sc = scrubStatuses[fs.name]}
 							<Button
@@ -2140,9 +1002,6 @@
 									{mountingFs === fs.name ? 'Mounting…' : 'Mount degraded'}
 								</Button>
 							{/if}
-							{#if e.reason === 'needs_unlock' && fs.options.encrypted && fs.options.locked}
-								<Button variant="default" size="xs" onclick={() => doUnlock(fs.name)}>Unlock</Button>
-							{/if}
 							{#if e.reason === 'needs_check'}
 								<Button variant="default" size="xs" onclick={() => startFsckInline(fs.name, false)}
 									disabled={fsckStatuses[fs.name]?.running}>
@@ -2151,7 +1010,7 @@
 							{/if}
 							<button type="button" class="text-xs text-muted-foreground underline underline-offset-2"
 								onclick={() => rawErrShown = rawErrShown === fs.name ? null : fs.name}>
-								{rawErrShown === fs.name ? 'Hide bcachefs output' : 'Show bcachefs output'}
+								{rawErrShown === fs.name ? 'Hide mount output' : 'Show mount output'}
 							</button>
 							<span class="ml-auto text-[0.65rem] text-muted-foreground">attempted {humanAgo(e.attempted_at)}</span>
 						</div>
@@ -2163,7 +1022,6 @@
 
 				{#if !fs.mounted}
 					{@const fsck = fsckStatuses[fs.name]}
-					{@const locked = fs.options.encrypted && fs.options.locked}
 					<div class="mt-3 rounded-md border border-border p-3">
 						<div class="flex flex-wrap items-center gap-2">
 							<span class="text-xs font-medium">Filesystem check (fsck)</span>
@@ -2176,21 +1034,18 @@
 							<div class="ml-auto flex gap-2">
 								<Button variant="secondary" size="xs"
 									onclick={() => startFsckInline(fs.name, false)}
-									disabled={fsck?.running || locked}
-									title={locked ? 'Unlock the filesystem before checking it.' : 'Read-only check (bcachefs fsck -n) — reports problems without changing anything.'}>
+									disabled={fsck?.running}
+									title="Read-only check (btrfs check) — reports problems without changing anything.">
 									{fsck?.running && !fsck.repair ? 'Checking…' : 'Dry run'}
 								</Button>
 								<Button variant="secondary" size="xs"
 									onclick={() => startFsckInline(fs.name, true)}
-									disabled={fsck?.running || locked}
-									title={locked ? 'Unlock the filesystem before checking it.' : 'Check and repair (bcachefs fsck -y) — modifies the filesystem to correct errors.'}>
+									disabled={fsck?.running}
+									title="Check and repair (btrfs check --repair) — modifies the filesystem to correct errors.">
 									{fsck?.running && fsck.repair ? 'Repairing…' : 'Run & repair'}
 								</Button>
 							</div>
 						</div>
-						{#if locked}
-							<p class="mt-1 text-[0.65rem] text-muted-foreground">Encrypted &amp; locked — unlock before running a check.</p>
-						{/if}
 						{#if fsck?.last_output}
 							<button type="button" class="mt-2 text-xs text-muted-foreground underline underline-offset-2"
 								onclick={() => fsckOutputShown = fsckOutputShown === fs.name ? null : fs.name}>
@@ -2205,10 +1060,9 @@
 
 				{#if fs.total_bytes > 0}
 					{@const fsReplicas = fs.options.data_replicas ?? 1}
-					{@const fsEc = fs.options.erasure_code ?? false}
-					{@const showUsable = fsReplicas > 1 || fsEc}
+					{@const showUsable = fsReplicas > 1}
 					{@const fsUsable = showUsable
-						? estimateUsableBytes(fs.total_bytes, fs.devices.length, fsReplicas, fsEc)
+						? estimateUsableBytes(fs.total_bytes, fs.devices.length, fsReplicas, false)
 						: fs.total_bytes}
 					{@const deviceCount = fs.devices.length}
 					{@const chip = scrubChip(scrubStatuses[fs.name])}
@@ -2218,12 +1072,9 @@
 						</div>
 						<span class="text-xs text-muted-foreground">
 							{formatBytes(fs.used_bytes)} / {formatBytes(fs.total_bytes)} ({formatPercent(fs.used_bytes, fs.total_bytes)})
-							{#if showUsable} · <span title="Estimate. bcachefs reports raw capacity; this is total ÷ replicas (or × (n-parity)/n with EC). Subvolumes can override replica counts.">~{formatBytes(fsUsable)} usable</span>{/if}
+							{#if showUsable} · <span title="Estimate: total ÷ replicas for raid1.">~{formatBytes(fsUsable)} usable</span>{/if}
 							· {deviceCount} {deviceCount === 1 ? 'device' : 'devices'}
-							{#if fsReplicas > 1} · {fsReplicas} replicas{/if}
-							{#if fsEc} · <span title="Erasure coding (Reed-Solomon parity). At {fsReplicas} replicas this is a {fsReplicas === 2 ? 'RAID-5' : 'RAID-6'}-style layout.">erasure code</span>{/if}
-							{#if fs.options.encrypted} · <span title={fs.options.locked ? 'Encrypted, currently locked — unlock to mount.' : 'Encrypted.'}>encrypted{fs.options.locked ? ' · locked' : ''}</span>{/if}
-							{#if fs.options.encrypted && tpmStatus[fs.name]?.bound} · <span title="Encryption key is sealed to this host's TPM2, bound to PCR 7. Auto-unlock prefers the sealed copy and falls back to the plaintext .key on unseal failure.">TPM-bound</span>{/if}
+							{#if fsReplicas > 1} · raid1{/if}
 							{#if fs.options.compression} · {fs.options.compression}{/if}
 							· <span class={chip.cls} title={chip.title}>{chip.label}</span>
 						</span>
@@ -2233,190 +1084,21 @@
 				{#if editOptionsFs === fs.name}
 				<div class="mt-4 border-t border-border pt-4">
 					<h4 class="mb-4 text-xs uppercase tracking-wide text-muted-foreground">Edit Options</h4>
-					<div class="grid grid-cols-1 gap-5 sm:grid-cols-2">
-						<!-- Compression -->
-						<fieldset class="rounded-md border border-border p-3">
-							<legend class="px-1.5 text-[0.65rem] uppercase tracking-wide text-muted-foreground">Compression</legend>
-							<div class="grid grid-cols-2 gap-3">
-								<div>
-									<label for="edit-compression-{fs.name}" class="mb-1 block text-xs text-muted-foreground">Foreground</label>
-									<div class="flex gap-2">
-										<select id="edit-compression-{fs.name}" bind:value={editCompression} onchange={() => editCompressionLevel = ''} class="h-8 flex-1 rounded-md border border-input bg-transparent px-2 text-sm">
-											<option value="">None</option>
-											<option value="lz4">LZ4</option>
-											<option value="zstd">Zstd</option>
-											<option value="gzip">Gzip</option>
-										</select>
-										{#if compressionMaxLevel(editCompression) !== null}
-											<input type="number" bind:value={editCompressionLevel} min="1" max={compressionMaxLevel(editCompression)} placeholder="lvl" title="Optional {editCompression} level (1–{compressionMaxLevel(editCompression)}). Blank = default." class="h-8 w-16 rounded-md border border-input bg-transparent px-2 text-sm" />
-										{/if}
-									</div>
-								</div>
-								<div>
-									<label for="edit-bg-compression-{fs.name}" class="mb-1 block text-xs text-muted-foreground">Background</label>
-									<div class="flex gap-2">
-										<select id="edit-bg-compression-{fs.name}" bind:value={editBgCompression} onchange={() => editBgCompressionLevel = ''} class="h-8 flex-1 rounded-md border border-input bg-transparent px-2 text-sm">
-											<option value="">None</option>
-											<option value="lz4">LZ4</option>
-											<option value="zstd">Zstd</option>
-											<option value="gzip">Gzip</option>
-										</select>
-										{#if compressionMaxLevel(editBgCompression) !== null}
-											<input type="number" bind:value={editBgCompressionLevel} min="1" max={compressionMaxLevel(editBgCompression)} placeholder="lvl" title="Optional {editBgCompression} level (1–{compressionMaxLevel(editBgCompression)}). Blank = default." class="h-8 w-16 rounded-md border border-input bg-transparent px-2 text-sm" />
-										{/if}
-									</div>
-								</div>
-							</div>
-						</fieldset>
-						<!-- Data Protection (basic) -->
-						<fieldset class="rounded-md border border-border p-3">
-							<legend class="px-1.5 text-[0.65rem] uppercase tracking-wide text-muted-foreground">Data Protection</legend>
-							<div>
-								<label for="edit-data-replicas-{fs.name}" class="mb-1 block text-xs text-muted-foreground">Data Replicas</label>
-								<input id="edit-data-replicas-{fs.name}" type="number" min="1" max="4" bind:value={editDataReplicas} class="h-8 w-32 rounded-md border border-input bg-transparent px-2 text-sm" />
-							</div>
-							<label class="mt-3 flex cursor-pointer items-center gap-2 text-sm">
-								<input id="edit-erasure-{fs.name}" type="checkbox" bind:checked={editErasureCode} class="h-4 w-4" />
-								<span class="text-xs">Erasure coding</span>
-							</label>
-						</fieldset>
-						<!-- Data Targets (#434): route each data class to a device-label tier -->
-						<fieldset class="rounded-md border border-border p-3 sm:col-span-2">
-							<legend class="px-1.5 text-[0.65rem] uppercase tracking-wide text-muted-foreground">Data Targets</legend>
-							{#if targetOptions(fs).length === 0}
-								<p class="text-xs text-muted-foreground">No device labels set. Label devices (e.g. <span class="font-mono">ssd.fast</span>, <span class="font-mono">hdd.bulk</span>) in the device table above, then point targets at them here.</p>
-							{:else}
-								{@const targets = targetOptions(fs)}
-								{#snippet targetOpts()}
-									<option value="">none</option>
-									{#each targets as t}<option value={t.value}>{t.value}{t.group ? ` — group (${t.count})` : ''}</option>{/each}
-								{/snippet}
-								<div class="grid grid-cols-2 gap-3 sm:grid-cols-4">
-									<div>
-										<label for="edit-fg-target-{fs.name}" class="mb-1 block text-xs text-muted-foreground">Foreground</label>
-										<select id="edit-fg-target-{fs.name}" bind:value={editForegroundTarget} class="h-8 w-full rounded-md border border-input bg-transparent px-2 text-sm">
-											{@render targetOpts()}
-										</select>
-									</div>
-									<div>
-										<label for="edit-bg-target-{fs.name}" class="mb-1 block text-xs text-muted-foreground">Background</label>
-										<select id="edit-bg-target-{fs.name}" bind:value={editBackgroundTarget} class="h-8 w-full rounded-md border border-input bg-transparent px-2 text-sm">
-											{@render targetOpts()}
-										</select>
-									</div>
-									<div>
-										<label for="edit-meta-target-{fs.name}" class="mb-1 block text-xs text-muted-foreground">Metadata</label>
-										<select id="edit-meta-target-{fs.name}" bind:value={editMetadataTarget} class="h-8 w-full rounded-md border border-input bg-transparent px-2 text-sm">
-											{@render targetOpts()}
-										</select>
-									</div>
-									<div>
-										<label for="edit-promote-target-{fs.name}" class="mb-1 block text-xs text-muted-foreground">Promote</label>
-										<select id="edit-promote-target-{fs.name}" bind:value={editPromoteTarget} class="h-8 w-full rounded-md border border-input bg-transparent px-2 text-sm">
-											{@render targetOpts()}
-										</select>
-									</div>
-								</div>
-								<p class="mt-1.5 text-[0.6rem] text-muted-foreground">Foreground/metadata = where new writes land; background = where the rebalance thread migrates; promote = read cache tier. A <strong>group</strong> (e.g. <span class="font-mono">hdd</span>) targets every device under it.</p>
+					<fieldset class="max-w-md rounded-md border border-border p-3">
+						<legend class="px-1.5 text-[0.65rem] uppercase tracking-wide text-muted-foreground">Compression</legend>
+						<label for="edit-compression-{fs.name}" class="mb-1 block text-xs text-muted-foreground">Algorithm</label>
+						<div class="flex gap-2">
+							<select id="edit-compression-{fs.name}" bind:value={editCompression} onchange={() => editCompressionLevel = ''} class="h-8 flex-1 rounded-md border border-input bg-transparent px-2 text-sm">
+								<option value="">None</option>
+								<option value="lz4">LZ4</option>
+								<option value="zstd">Zstd</option>
+								<option value="gzip">Gzip</option>
+							</select>
+							{#if compressionMaxLevel(editCompression) !== null}
+								<input type="number" bind:value={editCompressionLevel} min="1" max={compressionMaxLevel(editCompression)} placeholder="lvl" title="Optional {editCompression} level (1–{compressionMaxLevel(editCompression)}). Blank = default." class="h-8 w-16 rounded-md border border-input bg-transparent px-2 text-sm" />
 							{/if}
-						</fieldset>
-					</div>
-
-					<!-- Advanced options — bcachefs tuning knobs most users won't touch -->
-					<div class="mt-4">
-						<button
-							type="button"
-							onclick={() => showEditAdvanced = !showEditAdvanced}
-							class="flex items-center gap-1 text-sm font-medium text-muted-foreground hover:text-foreground"
-						>
-							<span class="inline-block w-3 text-xs">{showEditAdvanced ? '▾' : '▸'}</span>
-							Advanced options
-						</button>
-						{#if showEditAdvanced}
-							<div class="mt-3 grid grid-cols-1 gap-5 sm:grid-cols-2">
-								<!-- Checksums + Metadata Replicas -->
-								<fieldset class="rounded-md border border-border p-3">
-									<legend class="px-1.5 text-[0.65rem] uppercase tracking-wide text-muted-foreground">Checksums &amp; Metadata</legend>
-									<div>
-										<label for="edit-meta-replicas-{fs.name}" class="mb-1 block text-xs text-muted-foreground">Metadata Replicas</label>
-										<input id="edit-meta-replicas-{fs.name}" type="number" min="1" max="4" bind:value={editMetadataReplicas} class="h-8 w-32 rounded-md border border-input bg-transparent px-2 text-sm" />
-									</div>
-									<div class="mt-3 grid grid-cols-2 gap-3">
-										<div>
-											<label for="edit-data-checksum-{fs.name}" class="mb-1 block text-xs text-muted-foreground">Data Checksum</label>
-											<select id="edit-data-checksum-{fs.name}" bind:value={editDataChecksum} class="h-8 w-full rounded-md border border-input bg-transparent px-2 text-sm">
-												<option value="none">None</option>
-												<option value="crc32c">CRC32C</option>
-												<option value="crc64">CRC64</option>
-												<option value="xxhash">xxHash</option>
-											</select>
-										</div>
-										<div>
-											<label for="edit-meta-checksum-{fs.name}" class="mb-1 block text-xs text-muted-foreground">Metadata Checksum</label>
-											<select id="edit-meta-checksum-{fs.name}" bind:value={editMetadataChecksum} class="h-8 w-full rounded-md border border-input bg-transparent px-2 text-sm">
-												<option value="none">None</option>
-												<option value="crc32c">CRC32C</option>
-												<option value="crc64">CRC64</option>
-												<option value="xxhash">xxHash</option>
-											</select>
-										</div>
-									</div>
-								</fieldset>
-								<!-- Background Mover -->
-								<fieldset class="rounded-md border border-border p-3">
-									<legend class="px-1.5 text-[0.65rem] uppercase tracking-wide text-muted-foreground">Background Mover</legend>
-									<div class="grid grid-cols-2 gap-3">
-										<div>
-											<label for="edit-move-ios-{fs.name}" class="mb-1 block text-xs text-muted-foreground">IOs in Flight</label>
-											<input id="edit-move-ios-{fs.name}" type="number" min="1" max="256" bind:value={editMoveIos} class="h-8 w-full rounded-md border border-input bg-transparent px-2 text-sm" />
-										</div>
-										<div>
-											<label for="edit-move-bytes-{fs.name}" class="mb-1 block text-xs text-muted-foreground">Bytes in Flight</label>
-											<input id="edit-move-bytes-{fs.name}" type="text" placeholder="e.g. 8.0M" bind:value={editMoveBytes} class="h-8 w-full rounded-md border border-input bg-transparent px-2 text-sm" />
-										</div>
-									</div>
-								</fieldset>
-								<!-- Mount Options -->
-								<fieldset class="rounded-md border border-border p-3 sm:col-span-2">
-									<legend class="px-1.5 text-[0.65rem] uppercase tracking-wide text-muted-foreground">Mount Options</legend>
-									<div>
-										<label for="edit-vu-{fs.name}" class="mb-1 block text-xs text-muted-foreground">Version Upgrade</label>
-										<select id="edit-vu-{fs.name}" bind:value={editVersionUpgrade} class="h-8 w-full rounded-md border border-input bg-transparent px-2 text-sm">
-											<option value="">None</option>
-											<option value="compatible">Compatible</option>
-											<option value="incompatible">Incompatible</option>
-										</select>
-									</div>
-									<div class="mt-2 grid grid-cols-2 gap-x-3 gap-y-1.5">
-										<label class="flex cursor-pointer items-center gap-2">
-											<input type="checkbox" bind:checked={editDegraded} class="h-3.5 w-3.5" />
-											<span class="text-xs">Degraded mode</span>
-										</label>
-										<label class="flex cursor-pointer items-center gap-2">
-											<input type="checkbox" bind:checked={editFsck} class="h-3.5 w-3.5" />
-											<span class="text-xs">Fsck on mount</span>
-										</label>
-										<label class="flex cursor-pointer items-center gap-2">
-											<input type="checkbox" bind:checked={editVerbose} class="h-3.5 w-3.5" />
-											<span class="text-xs">Verbose</span>
-										</label>
-										<label class="flex cursor-pointer items-center gap-2">
-											<input type="checkbox" bind:checked={editJournalFlushDisabled} class="h-3.5 w-3.5" />
-											<span class="text-xs">Disable journal flush</span>
-										</label>
-									</div>
-									<div class="mt-2 max-w-xs">
-										<div>
-											<Label class="text-[0.65rem]">Journal flush delay (µs)</Label>
-											<Input type="number" bind:value={editJournalFlushDelay} placeholder="1000" class="mt-0.5 h-7 text-xs" />
-										</div>
-									</div>
-									<p class="mt-1.5 text-[0.6rem] text-muted-foreground">This requires a remount to take effect.</p>
-								</fieldset>
-							</div>
-						{/if}
-					</div>
-
+						</div>
+					</fieldset>
 					<div class="mt-4 flex gap-2">
 						<Button size="xs" onclick={() => saveOptions(fs.name)}>Save</Button>
 						<Button variant="secondary" size="xs" onclick={() => editOptionsFs = null}>Cancel</Button>
@@ -2426,55 +1108,11 @@
 
 				{#if expandedFs === fs.name}
 					<div class="mt-4 border-t border-border pt-4">
-						<div class="mb-4 grid grid-cols-1 gap-6 lg:grid-cols-2">
-							<!-- Properties -->
-							<div class="grid grid-cols-[auto_1fr] gap-x-4 gap-y-0.5 text-xs self-start">
-								<span class="text-muted-foreground">Replicas</span>
-								<span>{fs.options.data_replicas ?? 1}</span>
-								<span class="text-muted-foreground">Checksum</span>
-								<span>{fs.options.data_checksum ?? '—'}</span>
-								<span class="text-muted-foreground">Compression</span>
-								<span>{fs.options.compression ?? 'none'}{#if fs.options.background_compression} / bg: {fs.options.background_compression}{/if}</span>
-								<span class="text-muted-foreground">Erasure Code</span>
-								<span>{fs.options.erasure_code ? 'Enabled' : 'No'}</span>
-								<span class="text-muted-foreground">Encrypted</span>
-								<span>
-									{#if fs.options.encrypted}
-										Yes
-										{#if fs.options.locked}
-											<Badge variant="destructive" class="ml-1 text-[0.6rem]">Locked</Badge>
-										{:else}
-											<Badge variant="default" class="ml-1 text-[0.6rem]">Unlocked</Badge>
-										{/if}
-										{#if fs.options.key_stored}
-											<Badge variant="secondary" class="ml-1 text-[0.6rem]">Auto-unlock</Badge>
-										{/if}
-									{:else}
-										No
-									{/if}
-								</span>
-								{#if fs.options.error_action}
-									<span class="text-muted-foreground">Error Action</span>
-									<span>{fs.options.error_action}</span>
-								{/if}
-								{#if fs.options.journal_flush_delay}
-									<span class="text-muted-foreground">Journal Flush Delay</span>
-									<span>{fs.options.journal_flush_delay} µs</span>
-								{/if}
-							</div>
-
-							<!-- Targets -->
-							<div class="grid grid-cols-[auto_1fr] gap-x-4 gap-y-0.5 text-xs self-start">
-								<span class="text-[10px] font-medium uppercase tracking-wide text-muted-foreground col-span-2 mb-1">Data Targets</span>
-								<span class="text-muted-foreground">Foreground</span>
-								<span>{fs.options.foreground_target ?? '—'}</span>
-								<span class="text-muted-foreground">Background</span>
-								<span>{fs.options.background_target ?? '—'}</span>
-								<span class="text-muted-foreground">Metadata</span>
-								<span>{fs.options.metadata_target ?? '—'}</span>
-								<span class="text-muted-foreground">Promote</span>
-								<span>{fs.options.promote_target ?? '—'}</span>
-							</div>
+						<div class="mb-4 grid grid-cols-[auto_1fr] gap-x-4 gap-y-0.5 text-xs self-start max-w-md">
+							<span class="text-muted-foreground">Data profile</span>
+							<span>{(fs.options.data_replicas ?? 1) > 1 ? 'raid1' : 'single'}</span>
+							<span class="text-muted-foreground">Compression</span>
+							<span>{fs.options.compression ?? 'none'}</span>
 						</div>
 
 						<div class="mb-1 flex justify-end">
@@ -2509,7 +1147,6 @@
 									{#if colOn('csum_err')}<SortTh label="Cksum err" active={devSortKey === 'csum_err'} dir={devSortDir} thClass="p-2" onclick={() => toggleDevSort('csum_err')} />{/if}
 									{#if colOn('data_allowed')}<SortTh label="Data Allowed" active={devSortKey === 'data_allowed'} dir={devSortDir} thClass="p-2" onclick={() => toggleDevSort('data_allowed')} />{/if}
 									{#if colOn('has_data')}<SortTh label="Has Data" active={devSortKey === 'has_data'} dir={devSortDir} thClass="p-2" onclick={() => toggleDevSort('has_data')} />{/if}
-									<th class="p-2 text-left text-xs uppercase text-muted-foreground w-px whitespace-nowrap">Actions</th>
 								</tr>
 							</thead>
 							<tbody>
@@ -2524,36 +1161,13 @@
 												<span class="ml-1 rounded bg-secondary px-1 py-0.5 text-[10px] text-muted-foreground">discard</span>
 											{/if}
 										</td>
-										<td class="p-2 text-xs">
-										{#if fs.mounted && !dev.missing && editingLabel === `${fs.name}|${dev.path}`}
-											<!-- svelte-ignore a11y_autofocus -->
-											<input
-												class="w-28 rounded border border-input bg-background px-1.5 py-0.5 font-mono text-xs focus:outline-none focus:ring-1 focus:ring-ring"
-												bind:value={editLabelValue}
-												onblur={() => saveDeviceLabel(fs.name, dev.path)}
-												onkeydown={(e) => { if (e.key === 'Enter') saveDeviceLabel(fs.name, dev.path); if (e.key === 'Escape') editingLabel = null; }}
-												autofocus
-											/>
-										{:else}
-											<button
-												class="group inline-flex items-center gap-1 rounded px-1 py-0.5 text-left hover:bg-secondary {dev.label ? '' : 'text-muted-foreground'} {fs.mounted ? 'cursor-text' : 'cursor-default'}"
-												onclick={() => { if (fs.mounted && !dev.missing) startEditLabel(fs.name, dev); }}
-												title={fs.mounted ? 'Click to edit label' : ''}
-											>
-												<span>{dev.label ?? '—'}</span>
-												{#if fs.mounted}
-													<Pencil size={11} class="shrink-0 text-muted-foreground/40 transition-colors group-hover:text-muted-foreground" />
-												{/if}
-											</button>
-										{/if}
-									</td>
+										<td class="p-2 text-xs {dev.label ? '' : 'text-muted-foreground'}">{dev.label ?? '—'}</td>
 										<td class="p-2">
 											{#if dev.missing}
-												<span class="rounded bg-red-950 px-2 py-0.5 text-xs font-semibold text-red-400" title="Member device is gone — force-remove it from the pool">missing</span>
+												<span class="rounded bg-red-950 px-2 py-0.5 text-xs font-semibold text-red-400" title="Member device is not currently detected">missing</span>
 											{:else if dev.state !== null}
-												{@const ds = devDisplayState(dev)}
-												<span class="rounded px-2 py-0.5 text-xs font-semibold {stateColor(ds)}">
-													{ds}
+												<span class="rounded px-2 py-0.5 text-xs font-semibold {stateColor(dev.state)}">
+													{dev.state}
 												</span>
 											{:else}
 												<span class="text-muted-foreground">—</span>
@@ -2580,7 +1194,7 @@
 												{#if dev.rotational == null}
 													<span class="text-muted-foreground">—</span>
 												{:else if mismatch}
-													<span class="text-amber-500" title="bcachefs has this device marked rotational, but the hardware is solid-state — likely a mis-latched superblock flag (bcachefs-tools #594).">yes ⚠</span>
+													<span class="text-amber-500" title="Filesystem marks this device rotational, but the hardware is solid-state.">yes ⚠</span>
 												{:else}
 													<span class="text-muted-foreground">{dev.rotational ? 'yes' : 'no'}</span>
 												{/if}
@@ -2621,122 +1235,11 @@
 										{#if colOn('has_data')}
 											<td class="p-2 font-mono text-xs text-muted-foreground">{dev.has_data ?? '—'}</td>
 										{/if}
-										<td class="p-2 w-px whitespace-nowrap">
-											<div class="flex gap-1.5 items-center">
-											{#if fs.mounted && dev.missing}
-												{@const reattach = reattachPath(fs, dev)}
-												{@const busy = !!busyDevices[dev.path] || (reattach != null && !!busyDevices[reattach])}
-												{#if reattach}
-													<Button size="xs" disabled={busy} onclick={() => onlineDevice(fs.name, reattach)} title="Re-attach {reattach} to this pool with its data intact">Bring online</Button>
-												{:else}
-													<span class="text-xs italic text-muted-foreground" title="The disk for this member slot is not currently detected. Reconnect it — it may reappear under a different name, in which case Bring online and Add Device will offer to re-attach it.">disk not detected</span>
-												{/if}
-												<Button variant="destructive" size="xs" disabled={busy} onclick={() => removeMissingDevice(fs.name, dev)}>Remove (force)</Button>
-											{:else if fs.mounted}
-												{@const ds = devDisplayState(dev)}
-												{@const busy = !!busyDevices[dev.path]}
-												{#if ds === 'evacuating'}
-													<Button variant="destructive" size="xs" disabled={busy} onclick={() => removeDevice(fs.name, dev.path)}>Remove</Button>
-												{:else}
-													{#if ds === 'rw'}
-														<Button variant="secondary" size="xs" disabled={busy} onclick={() => setDeviceState(fs.name, dev.path, 'ro')}>Set RO</Button>
-														<Button variant="secondary" size="xs" disabled={busy} onclick={() => offlineDevice(fs.name, dev.path)}>Offline</Button>
-													{:else if ds === 'ro'}
-														<Button variant="secondary" size="xs" disabled={busy} onclick={() => setDeviceState(fs.name, dev.path, 'rw')}>Set RW</Button>
-													{/if}
-													<Button variant="secondary" size="xs" disabled={busy} onclick={() => evacuateDevice(fs.name, dev.path)}>Evacuate</Button>
-													<Button variant="destructive" size="xs" disabled={busy} onclick={() => removeDevice(fs.name, dev.path)}>Remove</Button>
-												{/if}
-											{/if}
-											</div>
-										</td>
 									</tr>
 								{/each}
 							</tbody>
 						</table>
 
-						{#if fs.mounted}
-							{#if addDeviceFs === fs.name}
-								<div class="mt-3 rounded-lg bg-secondary p-3">
-									<div class="mb-2 flex items-center justify-between">
-										<Label>Add Device</Label>
-										<label class="flex cursor-pointer items-center gap-1.5 text-xs text-muted-foreground">
-											<input type="checkbox" bind:checked={showAddPartitions} class="h-3.5 w-3.5" />
-											Show partitions
-										</label>
-									</div>
-									{#if availableDevicesForAdd().length === 0}
-										<p class="text-sm text-muted-foreground">No available devices. Wipe or prepare them in <Button size="xs" onclick={() => goto('/disks')}>Disks</Button></p>
-									{:else}
-										{#each availableDevicesForAdd() as dev}
-											{@const smart = smartFor(dev.path)}
-											{@const kind = addCandidateKind(dev, fs)}
-											{@const selectable = kind === 'plain' || kind === 'foreign'}
-											<label class="flex items-start gap-2 rounded-md border border-border/50 p-2 text-sm {selectable ? 'cursor-pointer hover:bg-secondary/40' : ''} {addDevicePath === dev.path ? 'border-primary bg-primary/5' : ''}">
-												<input type="radio" name="add-device" value={dev.path} bind:group={addDevicePath} disabled={!selectable} class="mt-0.5 h-4 w-4 shrink-0" />
-												<span class="min-w-0 flex-1">
-													<span class="flex flex-wrap items-center gap-x-2 gap-y-0.5">
-														<span class="font-mono">{dev.path}</span>
-														<span class="text-muted-foreground">{formatBytes(dev.size_bytes)}</span>
-														<span class="rounded bg-secondary px-1 py-0.5 text-[10px] uppercase text-muted-foreground">{dev.device_class}</span>
-														{#if dev.dev_type === 'part'}<span class="rounded bg-secondary px-1 py-0.5 text-[10px] text-muted-foreground">part</span>{/if}
-														{#if kind === 'offline_member'}
-															<span class="rounded bg-sky-950 px-1.5 py-0.5 text-[10px] text-sky-400" title="This disk's superblock belongs to this filesystem and a member slot is offline — bring it back online with its data intact. Do not wipe it.">offline member of this pool</span>
-														{:else if kind === 'former_member'}
-															<span class="rounded bg-amber-950 px-1.5 py-0.5 text-[10px] text-amber-400" title="This disk used to belong to this filesystem but its member slot was removed (data evacuated). Wipe it in Disks before re-adding it as a new device.">former member of this pool · wipe to re-add</span>
-														{:else if dev.fs_type}
-															<span class="rounded bg-amber-950 px-1 py-0.5 text-[10px] text-amber-400" title="Already has a filesystem — wipe it in Disks first">{dev.fs_type}</span>
-														{/if}
-													</span>
-													<span class="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[0.7rem] text-muted-foreground">
-														{#if dev.model}<span class="font-mono">{dev.model}</span>{/if}
-														{#if dev.serial}<span class="font-mono">SN {dev.serial}</span>{/if}
-														{#if smart}
-															<span class="font-medium {smart.health_passed ? 'text-green-500' : 'text-red-500'}" title="SMART overall health">SMART {smart.health_passed ? 'OK' : smart.smart_status}</span>
-															{#if smart.power_on_hours != null}<span title="Power-on hours">· {smart.power_on_hours.toLocaleString()}h</span>{/if}
-															{#if smart.temperature_c != null}<span title="Temperature">· {smart.temperature_c}°C</span>{/if}
-														{:else}
-															<span class="italic" title="No SMART data — virtual disk, USB bridge, or SMART service off">no SMART</span>
-														{/if}
-													</span>
-												</span>
-												{#if kind === 'offline_member'}
-													<Button size="xs" class="shrink-0" disabled={!!busyDevices[dev.path]} onclick={() => onlineDevice(fs.name, dev.path)}>Bring online</Button>
-												{/if}
-											</label>
-										{/each}
-									{/if}
-									{#if addDevicePath}
-										<div class="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
-											<div>
-												<Label for="add-dev-label">Label (optional)</Label>
-												<Input id="add-dev-label" bind:value={addDeviceLabel} placeholder="e.g. ssd.fast" class="mt-1" />
-												<p class="mt-1 text-[0.65rem] text-muted-foreground">Tiering group — point Data Targets at it in Options.</p>
-											</div>
-											<div>
-												<Label for="add-dev-durability">Durability</Label>
-												<select id="add-dev-durability" bind:value={addDeviceDurability} class="mt-1 h-9 w-full rounded-md border border-input bg-transparent px-2 text-sm">
-													<option value="1">Normal (1) — counts as one replica</option>
-													<option value="0">Cache (0) — no replica, evictable</option>
-													<option value="2">Hardware RAID (2) — counts as two</option>
-												</select>
-												<p class="mt-1 text-[0.65rem] text-muted-foreground">How many replicas a copy here counts for.</p>
-											</div>
-										</div>
-									{/if}
-									<div class="mt-2 flex items-center gap-2">
-										<Button size="xs" onclick={() => addDevice(fs.name)} disabled={!addDevicePath || !!busyDevices[addDevicePath]}>Add</Button>
-										<Button variant="secondary" size="xs" onclick={() => { addDeviceFs = null; addDevicePath = ''; addDeviceLabel = ''; }}>Cancel</Button>
-										{#if availableDevicesForAdd().length > 0}
-											<span class="ml-auto text-xs text-muted-foreground">Need to wipe a disk first?</span>
-											<Button size="xs" variant="secondary" onclick={() => goto('/disks')}>Disks</Button>
-										{/if}
-									</div>
-								</div>
-							{:else}
-								<Button variant="secondary" size="xs" class="mt-3" onclick={() => addDeviceFs = fs.name}>+ Add Device</Button>
-							{/if}
-						{/if}
 					</div>
 				{/if}
 			</CardContent>
@@ -2746,7 +1249,3 @@
 
 {/if}
 <!-- end pageTab === 'manage' -->
-<!-- The unlock modal that used to live here is now a global imperative
-     dialog mounted once in the root layout (see UnlockFsDialog.svelte).
-     The Apps and VMs pages call into the same dialog via `unlockFs(name)`
-     when their locked-FS badge is clicked. -->

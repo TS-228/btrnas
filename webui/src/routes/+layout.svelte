@@ -14,10 +14,10 @@
 	import LauncherSidebarNav from '$lib/components/LauncherSidebarNav.svelte';
 	import { confirm } from '$lib/confirm.svelte';
 	import type { AuthResult } from '$lib/rpc';
-	import type { BackupProfile, BootStatus, BootPhase, SecureBootReadinessReport, SystemStatus } from '$lib/types';
+	import type { BackupProfile, BootStatus, BootPhase, SystemStatus } from '$lib/types';
 	import favicon from '$lib/assets/favicon.svg';
-	import logoLight from '$lib/assets/nasty.svg';
-	import logoDark from '$lib/assets/nasty-white.svg';
+	import logoLight from '$lib/assets/btrnas.svg';
+	import logoDark from '$lib/assets/btrnas-white.svg';
 	import { uiPrefs } from '$lib/uiPrefs.svelte';
 	import {
 		activeNavigationGroup,
@@ -36,7 +36,6 @@
 	import { Input } from '$lib/components/ui/input';
 	import { Label } from '$lib/components/ui/label';
 	import {
-		Settings,
 		RefreshCw,
 		Power,
 		RotateCcw,
@@ -47,7 +46,6 @@
 		Moon,
 		PanelLeftClose,
 		PanelLeftOpen,
-		Bug,
 		CircleHelp,
 		ExternalLink,
 		MessageCircle,
@@ -65,7 +63,7 @@
 	import { theme } from '$lib/theme.svelte';
 	import { terminalStatus } from '$lib/terminalStatus.svelte';
 	import { isManagementRole, isStandardUser, redirectForRole } from '$lib/access';
-	import { CORE_RECOVERY_PATHS, RECOVERY_BACKUP_CHANGED_EVENT, SECURE_BOOT_RECOVERY_SOURCE } from '$lib/recoveryBackup';
+	import { CORE_RECOVERY_PATHS, RECOVERY_BACKUP_CHANGED_EVENT } from '$lib/recoveryBackup';
 
 	let { children } = $props();
 	let connected = $state(false);
@@ -259,12 +257,6 @@
 		if (!connected || authInfo?.role !== 'admin' || configBackupDismissed) return;
 		try {
 			const requiredSources: string[] = [...CORE_RECOVERY_PATHS];
-			try {
-				const readiness = await getClient().call<SecureBootReadinessReport>('system.secure_boot.readiness');
-				if (readiness.sbctl_keys_already_generated) {
-					requiredSources.push(SECURE_BOOT_RECOVERY_SOURCE.path);
-				}
-			} catch { /* Secure Boot is optional. */ }
 			const profiles = await getClient().call<BackupProfile[]>('backup.profile.list');
 			configBackupMissing = !profiles.some(profile =>
 				profile.enabled
@@ -301,17 +293,10 @@
 	}
 
 	// Version info (loaded once after connect)
-	let sysInfo: { hostname: string; version: string; kernel: string; bcachefs_version: string; bcachefs_commit: string | null; bcachefs_pinned_ref: string | null; bcachefs_recommended_ref: string | null; bcachefs_is_custom: boolean; bcachefs_debug_checks: boolean; kvm_available: boolean; is_virtual: boolean } | null = $state(null);
+	let sysInfo: { hostname: string; version: string; kernel: string; kvm_available: boolean; is_virtual: boolean } | null = $state(null);
 	setContext(NAVIGATION_CONTEXT, {
 		get kvmAvailable() { return sysInfo?.kvm_available === true; },
 		get role() { return authInfo?.role; }
-	});
-	// bcachefs "update available": the pin differs from the version this
-	// NASty build ships, so a one-click sync is offered. Distinct from
-	// "reboot pending" (bcachefs_is_custom), which the restart banner owns.
-	const bcachefsUpdateAvail = $derived.by(() => {
-		const rec = sysInfo?.bcachefs_recommended_ref;
-		return !!rec && rec !== sysInfo?.bcachefs_pinned_ref;
 	});
 	let clock24h = $state(true);
 
@@ -792,7 +777,7 @@
 
 <svelte:head>
 	<link rel="icon" href={favicon} />
-	<title>{sysInfo?.hostname ? `${sysInfo.hostname} — NASty` : 'NASty'}</title>
+	<title>{sysInfo?.hostname ? `${sysInfo.hostname} — btrNAS` : 'btrNAS'}</title>
 </svelte:head>
 
 <Toasts />
@@ -816,7 +801,7 @@
 	-->
 	<div class="flex min-h-screen items-center justify-center bg-background p-6">
 		<div class="w-full max-w-lg rounded-xl border border-border bg-card p-8">
-			<img src={theme.isDark ? logoDark : logoLight} alt="NASty" class="mb-4 h-32 mx-auto" />
+			<img src={theme.isDark ? logoDark : logoLight} alt="btrNAS" class="mb-4 h-32 mx-auto" />
 			<h1 class="text-center text-lg font-semibold">NASty is starting up…</h1>
 			<p class="mt-1 text-center text-sm text-muted-foreground">
 				Waiting for the engine to finish restoring system state. Login will appear automatically once it's ready.
@@ -853,7 +838,7 @@
 {:else if showLogin}
 	<div class="flex min-h-screen items-center justify-center">
 		<div class="w-[340px] rounded-xl border border-border bg-card p-8">
-			<img src={theme.isDark ? logoDark : logoLight} alt="NASty" class="mb-4 h-48 mx-auto" />
+			<img src={theme.isDark ? logoDark : logoLight} alt="btrNAS" class="mb-4 h-48 mx-auto" />
 			<p class="mb-6 text-sm text-muted-foreground">Sign in to manage your storage</p>
 			{#if loginError}
 				<p class="mb-4 text-sm text-destructive">{loginError}</p>
@@ -895,7 +880,7 @@
 {:else if showPasswordChange}
 	<div class="flex min-h-screen items-center justify-center">
 		<div class="w-[380px] rounded-xl border border-border bg-card p-8">
-			<img src={theme.isDark ? logoDark : logoLight} alt="NASty" class="mb-4 h-48 mx-auto" />
+			<img src={theme.isDark ? logoDark : logoLight} alt="btrNAS" class="mb-4 h-48 mx-auto" />
 			<h2 class="mb-2 text-lg font-semibold">Change your password</h2>
 			<p class="mb-6 text-sm text-muted-foreground">The default password must be changed before continuing.</p>
 			{#if passwordError}
@@ -953,7 +938,7 @@
 			{:else}
 				<div class="shrink-0 border-b border-border px-4 py-4 relative">
 					<a href="https://github.com/nasty-project" target="_blank" rel="noopener noreferrer">
-					<img src={theme.isDark ? logoDark : logoLight} alt="NASty" class="h-40" />
+					<img src={theme.isDark ? logoDark : logoLight} alt="btrNAS" class="h-40" />
 				</a>
 					<button onclick={() => uiPrefs.setLogoHidden(true)} class="absolute top-2 right-7 text-muted-foreground/50 hover:text-foreground transition-colors" title="Hide logo (restore in Settings → Appearance)">
 						<EyeOff size={15} />
@@ -1075,18 +1060,6 @@
 							<span class="text-[0.68rem] text-muted-foreground/50">kernel</span>
 							<span class="text-[0.68rem] font-mono text-muted-foreground/70 truncate ml-2 text-right" title={sysInfo.kernel}>{sysInfo.kernel}</span>
 						</div>
-						{@const bcachefsCommit = sysInfo.bcachefs_is_custom && sysInfo.bcachefs_commit && !/^v\d/.test(sysInfo.bcachefs_pinned_ref ?? '') ? sysInfo.bcachefs_commit : null}
-						{#if bcachefsCommit}
-							<div class="mt-0.5">
-								<span class="text-[0.68rem] text-muted-foreground/50">bcachefs</span>
-								<div class="text-[0.68rem] font-mono text-muted-foreground/70">{sysInfo.bcachefs_version} @ {bcachefsCommit}</div>
-							</div>
-						{:else}
-							<div class="flex items-center justify-between mt-0.5">
-								<span class="text-[0.68rem] text-muted-foreground/50">bcachefs</span>
-								<span class="text-[0.68rem] font-mono text-muted-foreground/70">{sysInfo.bcachefs_version}</span>
-							</div>
-						{/if}
 					{:else}
 						<div class="text-[0.68rem] text-muted-foreground/40">Loading…</div>
 					{/if}
@@ -1128,39 +1101,6 @@
 							<RotateCcw size={15} />
 							Kernel/driver update — click to restart
 						</button>
-					{/if}
-					<!-- bcachefs chip. Two distinct states, two distinct owners:
-					     - "update available" (pinned ref differs from the version
-					       this NASty build ships) → THIS chip, blue + arrow,
-					       click to switch the pin.
-					     - "reboot pending" (running module differs from the pin)
-					       → the amber "Kernel/driver update — click to restart"
-					       banner ABOVE, which already fires whenever the
-					       kernel-modules closure changes. We don't duplicate that
-					       action here; the gear icon is just a passive glance cue.
-					     The chip otherwise renders as a quiet status pill (debug
-					     build flags). Note the render condition includes the sync
-					     case directly — previously the offer was hidden unless a
-					     debug flag or pending reboot happened to be set too. -->
-					{#if sysInfo && (bcachefsUpdateAvail || sysInfo.bcachefs_is_custom || sysInfo.bcachefs_debug_checks)}
-						<a
-							href="/update#bcachefs"
-							class={bcachefsUpdateAvail
-								? 'flex items-center gap-2 rounded-md border-2 border-blue-500/70 px-3 py-1.5 text-sm text-blue-400 no-underline transition-all hover:bg-blue-500/10 hover:border-blue-400 hover:shadow-[0_0_16px_rgba(96,165,250,0.5)]'
-								: 'flex items-center gap-2 rounded-md border-2 border-white/15 px-3 py-1.5 text-sm text-muted-foreground/80 no-underline transition-all hover:bg-white/5 hover:border-white/30'}
-							title={bcachefsUpdateAvail
-								? `bcachefs update available — NASty ships ${sysInfo.bcachefs_recommended_ref} (you're pinned at ${sysInfo.bcachefs_pinned_ref ?? '—'}). Click to switch.`
-								: 'bcachefs status — click for details'}
-						>
-							<span>bcachefs</span>
-							{#if bcachefsUpdateAvail}
-								<span class="font-mono text-xs">→ {sysInfo.bcachefs_recommended_ref}</span>
-							{/if}
-							<span class="flex items-center gap-1.5">
-								<span title="Reboot pending — running module differs from the pinned version"><Settings size={14} class={sysInfo.bcachefs_is_custom ? 'text-amber-400' : 'text-muted-foreground/30'} /></span>
-								<span title="Debug checks enabled in the running module"><Bug size={14} class={sysInfo.bcachefs_debug_checks ? 'text-blue-400' : 'text-muted-foreground/30'} /></span>
-							</span>
-						</a>
 					{/if}
 					{#if rollbackState.pending}
 						<!-- Pending network rollback. Sticky on every page so the

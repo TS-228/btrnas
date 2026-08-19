@@ -38,6 +38,28 @@ pub(super) async fn try_route(
                 if let Some(proto) = nasty_system::protocol::Protocol::from_name(name) {
                     if matches!(
                         proto,
+                        nasty_system::protocol::Protocol::Ftp
+                            | nasty_system::protocol::Protocol::Sftp
+                            | nasty_system::protocol::Protocol::S3
+                    ) {
+                        let svc = match proto {
+                            nasty_system::protocol::Protocol::Ftp => &state.ftp,
+                            nasty_system::protocol::Protocol::Sftp => &state.sftp,
+                            nasty_system::protocol::Protocol::S3 => &state.s3,
+                            _ => unreachable!(),
+                        };
+                        if let Err(e) = svc.ensure_config().await {
+                            return Some(err(
+                                req,
+                                format!(
+                                    "failed to write {} rclone config: {e}",
+                                    proto.display_name()
+                                ),
+                            ));
+                        }
+                    }
+                    if matches!(
+                        proto,
                         nasty_system::protocol::Protocol::Iscsi
                             | nasty_system::protocol::Protocol::Nvmeof
                     ) {
@@ -95,6 +117,19 @@ pub(super) async fn try_route(
                         Err(e) => err(req, format!("firewall update failed: {e}")),
                         Ok(()) => match state.protocols.enable(name).await {
                             Ok(v) => {
+                                if matches!(
+                                    proto,
+                                    nasty_system::protocol::Protocol::Ftp
+                                        | nasty_system::protocol::Protocol::Sftp
+                                        | nasty_system::protocol::Protocol::S3
+                                ) && let Err(e) =
+                                    super::share::sync_rclone_firewall_ports(state, proto).await
+                                {
+                                    tracing::warn!(
+                                        "{} enabled but firewall port sync failed: {e}",
+                                        proto.display_name()
+                                    );
+                                }
                                 if proto == nasty_system::protocol::Protocol::Nvmeof
                                     && let Err(error) = state.nvmeof.restore().await
                                 {

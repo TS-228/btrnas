@@ -48,7 +48,7 @@ pub enum TpmError {
 /// Categorises which policy shape a [`SealedBlob`] was built under.
 /// Today every blob is `PolicyKind::Pcr7Static` (a fixed PCR-7
 /// reading captured at seal time). Future shapes — multi-PCR static
-/// (e.g. PCRs 0+4+7 once lanzaboote + measured boot land), or a
+/// (e.g. additional measured-boot PCRs), or a
 /// `systemd-pcrlock`-backed signed policy — will get their own
 /// variants. Having the discriminant on disk lets the unseal path
 /// route to the right replay logic instead of inferring it from the
@@ -73,7 +73,7 @@ pub enum PolicyKind {
 
 /// Default for legacy blobs written before this field existed.
 /// Serde uses this when deserialising a file that lacks `policy_kind`,
-/// so blobs written by pre-lanzaboote engines continue to load.
+/// so older on-disk seals continue to load.
 fn default_policy_kind() -> PolicyKind {
     PolicyKind::Pcr7Static
 }
@@ -404,7 +404,7 @@ mod tests {
 
     #[test]
     fn legacy_blob_without_policy_kind_loads_as_pcr7_static() {
-        // Pre-lanzaboote NASty engines wrote blobs without a
+        // Older engines wrote blobs without a
         // `policy_kind` field; serde defaults must produce
         // `Pcr7Static` so existing on-disk seals continue to load.
         let legacy_json = r#"{

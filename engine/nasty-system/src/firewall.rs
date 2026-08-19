@@ -318,11 +318,13 @@ fn tcp_range(from: u16, to: u16) -> PortSpec {
 pub fn ports_for_protocol(proto: Protocol) -> Vec<PortSpec> {
     match proto {
         Protocol::Nfs => vec![tcp(2049)],
-        // 445/139: Samba serving. 3702/udp: WSDD announcements for
-        // Windows 10/11 Explorer discovery (samba-wsdd.service).
+        // 445/139: ksmbd serving. 3702/udp: WSDD announcements (wsdd2).
         Protocol::Smb => vec![tcp(445), tcp(139), udp(3702)],
         Protocol::Iscsi => vec![tcp(3260)],
         Protocol::Nvmeof => vec![tcp(4420)],
+        Protocol::Ftp => vec![tcp(21), tcp_range(30000, 30100)],
+        Protocol::Sftp => vec![tcp(2022)],
+        Protocol::S3 => vec![tcp(9000)],
         Protocol::Nut => vec![tcp(3493)],
         Protocol::Ssh => vec![tcp(22)],
         Protocol::Avahi => vec![udp(5353)],
@@ -1412,6 +1414,29 @@ mod tests {
             ports
                 .iter()
                 .any(|p| p.port == 3702 && p.transport == Transport::Udp)
+        );
+    }
+
+    #[test]
+    fn rclone_protocols_open_serve_ports() {
+        let ftp = ports_for_protocol(Protocol::Ftp);
+        assert!(
+            ftp.iter()
+                .any(|p| p.port == 21 && p.to.is_none() && p.transport == Transport::Tcp)
+        );
+        assert!(
+            ftp.iter()
+                .any(|p| p.port == 30000 && p.to == Some(30100) && p.transport == Transport::Tcp)
+        );
+        let sftp = ports_for_protocol(Protocol::Sftp);
+        assert!(
+            sftp.iter()
+                .any(|p| p.port == 2022 && p.transport == Transport::Tcp)
+        );
+        let s3 = ports_for_protocol(Protocol::S3);
+        assert!(
+            s3.iter()
+                .any(|p| p.port == 9000 && p.transport == Transport::Tcp)
         );
     }
 

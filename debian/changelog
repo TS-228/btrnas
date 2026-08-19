@@ -1,0 +1,33 @@
+nasty (0.0.15-5) trixie; urgency=medium
+
+  * Add FTP, SFTP, and S3 shares via rclone serve, configurable in the WebUI.
+
+ -- Stephan <stephan@localhost>  Mon, 17 Aug 2026 14:00:00 +0200
+
+nasty (0.0.15-4) trixie; urgency=medium
+
+  * Depend on wsdd2 for Network discovery; override unit to bind to ksmbd (not smbd).
+
+ -- Stephan <stephan@localhost>  Sun, 16 Aug 2026 18:00:00 +0200
+
+nasty (0.0.15-3) trixie; urgency=medium
+
+  * Disks: show Wipe for partitioned disks even without live md holders.
+
+ -- Stephan <stephan@localhost>  Sun, 16 Aug 2026 17:05:00 +0200
+
+nasty (0.0.15-2) trixie; urgency=medium
+
+  * device.wipe releases md/dm/swap holders before wipefs (Reclaim on Disks).
+  * Surface held-by-md disks as in-use but wipeable in the WebUI.
+
+ -- Stephan <stephan@localhost>  Sun, 16 Aug 2026 16:50:00 +0200
+
+nasty (0.0.15-1) trixie; urgency=medium
+
+  * Initial Debian packaging for Trixie / armhf (QNAP TS-228).
+  * Replace NixOS updates with apt + snapper btrfs snapshots.
+  * Replace Samba with ksmbd; drop AD / Time Machine.
+  * Replace bcachefs data pools with btrfs (first-cut).
+
+ -- Stephan <stephan@localhost>  Sun, 16 Aug 2026 14:30:00 +0200

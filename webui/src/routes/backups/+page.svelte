@@ -6,14 +6,14 @@
 	import { confirm } from '$lib/confirm.svelte';
 	import { requiredFieldCls } from '$lib/utils';
 	import { formatBytes } from '$lib/format';
-	import type { BackupProfile, BackupSnapshot, BackupStatus, BackupJob, SecretsStatus, Subvolume, Filesystem, SecureBootReadinessReport } from '$lib/types';
+	import type { BackupProfile, BackupSnapshot, BackupStatus, BackupJob, SecretsStatus, Subvolume, Filesystem } from '$lib/types';
 	import { Button } from '$lib/components/ui/button';
 	import { Card, CardContent } from '$lib/components/ui/card';
 	import { Input } from '$lib/components/ui/input';
 	import { Label } from '$lib/components/ui/label';
 	import { Badge } from '$lib/components/ui/badge';
 	import PathPicker from '$lib/components/PathPicker.svelte';
-	import { CORE_RECOVERY_SOURCES, RECOVERY_BACKUP_CHANGED_EVENT, SECURE_BOOT_RECOVERY_SOURCE } from '$lib/recoveryBackup';
+	import { CORE_RECOVERY_SOURCES, RECOVERY_BACKUP_CHANGED_EVENT } from '$lib/recoveryBackup';
 	import { FolderOpen } from '@lucide/svelte';
 
 	const client = getClient();
@@ -22,13 +22,7 @@
 	let showCreate = $state(false);
 	let isAdmin = $state(false);
 	let canOperateBackups = $state(false);
-	let secureBootKeysAvailable = $state(false);
-	const recoverySources = $derived([
-		...CORE_RECOVERY_SOURCES,
-		...(secureBootKeysAvailable
-			? [SECURE_BOOT_RECOVERY_SOURCE]
-			: []),
-	]);
+	const recoverySources = $derived([...CORE_RECOVERY_SOURCES]);
 	let backupStatus: BackupStatus | null = $state(null);
 	/** Loaded once on mount from backup.secrets_status — drives the
 	 * small status pill near the page header. `null` means the
@@ -132,10 +126,6 @@
 			return;
 		}
 		if (!isAdmin) return;
-		try {
-			const readiness = await client.call<SecureBootReadinessReport>('system.secure_boot.readiness');
-			secureBootKeysAvailable = readiness.sbctl_keys_already_generated;
-		} catch { /* Secure Boot is optional. */ }
 	}
 
 	function toggleSource(path: string) {
@@ -856,7 +846,7 @@
 					</div>
 					{#if hasRecoverySource(newSources)}
 						<div class="mt-2 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">
-							This recovery snapshot contains appliance authentication state, filesystem recovery keys, TLS private keys, the host credential key, and possibly Secure Boot signing keys. Anyone with the repository password can recover this material. Use a strong, separately stored password. TPM-sealed credentials can still require the original TPM. Samba/AD databases are not included because they require a transaction-safe domain backup.
+							This recovery snapshot contains appliance authentication state, filesystem recovery keys, TLS private keys, and the host credential key. Anyone with the repository password can recover this material. Use a strong, separately stored password. TPM-sealed credentials can still require the original TPM. Samba/AD databases are not included because they require a transaction-safe domain backup.
 						</div>
 					{/if}
 				</div>

@@ -22,17 +22,12 @@
 		smbLoadSubvolumes,
 		smbEnsureSystemUsers,
 	} from '$lib/sharing/smb.svelte';
-	import { domain, domainSearchUsers } from '$lib/domain.svelte';
-	import type { SmbShare, DomainPrincipal } from '$lib/types';
+	import type { SmbShare } from '$lib/types';
 
 	const client = getClient();
 
-	let domainSearch = $state('');
-	let domainHits: DomainPrincipal[] = $state([]);
-
 	/** Append `entry` (a system username or `@group`) to a share's
-	 * valid_users and persist. Shared by the system-user/group buttons
-	 * and the domain-user search results below them. */
+	 * valid_users and persist. Shared by the system-user/group buttons. */
 	function addValidUser(share: SmbShare, entry: string) {
 		const valid_users = [...share.valid_users, entry];
 		withToast(() => client.call('share.smb.update', { id: share.id, valid_users }), `${entry} added`).then(() => smbRefresh());
@@ -101,38 +96,14 @@
 				<Label for="smb-comment">Comment</Label>
 				<Input id="smb-comment" bind:value={smb.newComment} placeholder="Optional description" class="mt-1" />
 			</div>
-			<div class="mb-4">
+			<div class="mb-4 flex gap-6">
 				<label class="flex cursor-pointer items-center gap-2">
-					<input
-						type="checkbox"
-						bind:checked={smb.newTimeMachine}
-						onchange={() => { if (smb.newTimeMachine) { smb.newGuestOk = false; smb.newReadOnly = false; } }}
-						class="h-4 w-4" />
-					Time Machine — macOS backup destination
+					<input type="checkbox" bind:checked={smb.newReadOnly} class="h-4 w-4" /> Read-only
 				</label>
-				{#if smb.newTimeMachine}
-					<div class="mt-2 ml-6 flex items-center gap-2 text-sm">
-						<span class="text-muted-foreground">Max size (GiB)</span>
-						<input
-							type="number"
-							min="1"
-							placeholder="unlimited"
-							value={smb.newTmMaxSize ?? ''}
-							oninput={(e) => { const v = (e.target as HTMLInputElement).value; smb.newTmMaxSize = v === '' ? null : Number(v); }}
-							class="h-8 w-32 rounded-md border border-input bg-transparent px-2 text-sm" />
-					</div>
-				{/if}
+				<label class="flex cursor-pointer items-center gap-2">
+					<input type="checkbox" bind:checked={smb.newGuestOk} class="h-4 w-4" /> Allow guests
+				</label>
 			</div>
-			{#if !smb.newTimeMachine}
-				<div class="mb-4 flex gap-6">
-					<label class="flex cursor-pointer items-center gap-2">
-						<input type="checkbox" bind:checked={smb.newReadOnly} class="h-4 w-4" /> Read-only
-					</label>
-					<label class="flex cursor-pointer items-center gap-2">
-						<input type="checkbox" bind:checked={smb.newGuestOk} class="h-4 w-4" /> Allow guests
-					</label>
-				</div>
-			{/if}
 			<Button onclick={smbCreateGuarded}>Create</Button>
 		</CardContent>
 	</Card>
@@ -161,9 +132,6 @@
 				>
 					<td class="p-3">
 						<strong>{share.name}</strong>
-						{#if share.time_machine}
-							<Badge variant="secondary" class="ml-2 bg-blue-950 text-blue-300">Time Machine</Badge>
-						{/if}
 						{#if share.comment}<br /><span class="text-xs text-muted-foreground">{share.comment}</span>{/if}
 					</td>
 					<td class="p-3 font-mono text-sm">{share.path}</td>
@@ -246,18 +214,6 @@
 												<Button size="xs" variant="secondary" onclick={() => goto('/users')}>Create User / Group</Button>
 												<Button variant="secondary" size="xs" onclick={() => { smb.addUserShare = null; }}>Done</Button>
 											</div>
-											{#if domain.status?.joined}
-												<div class="mt-2">
-													<Input bind:value={domainSearch} placeholder="Search domain users (2+ chars)…" class="h-8 text-xs"
-														oninput={async () => { domainHits = await domainSearchUsers(domainSearch); }} />
-													{#each domainHits.filter(p => !share.valid_users.includes(p.name)) as p}
-														<button class="block w-full rounded px-2 py-1 text-left font-mono text-xs hover:bg-secondary/50"
-															onclick={() => addValidUser(share, p.name)}>
-															{p.name}
-														</button>
-													{/each}
-												</div>
-											{/if}
 										</div>
 									{:else}
 										<Button variant="secondary" size="xs" onclick={(e) => {

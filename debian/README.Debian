@@ -1,0 +1,46 @@
+NASty on Debian Trixie (armhf / QNAP TS-228)
+============================================
+
+This packaging replaces the upstream NixOS appliance model with Debian
+packages and apt-based upgrades.
+
+Architecture
+------------
+Primary target: armhf (ARMv7 / Realtek RTD1195 on QNAP TS-228).
+Packages are Architecture: any / all and can also be built for amd64.
+
+Root filesystem
+---------------
+Root must be btrfs. On first configure, the `nasty` package runs
+`snapper -c root create-config /` when / is btrfs.
+
+Updates
+-------
+WebUI Update → apt-get upgrade (via nasty-engine).
+apt hooks in /etc/apt/apt.conf.d/80nasty-snapper create snapper
+pre/post snapshots around dpkg operations.
+Generations in the WebUI list snapper snapshots; Switch runs
+`snapper rollback <n>` (reboot required).
+
+Build
+-----
+  apt-get install build-essential debhelper cargo rustc nodejs npm \
+    libssl-dev pkg-config clang
+  # For TS-228 cross builds from amd64:
+  #   dpkg --add-architecture armhf
+  #   apt-get install crossbuild-essential-armhf
+  #   rustup target add armv7-unknown-linux-gnueabihf
+  dpkg-buildpackage -b -us -uc
+
+Install into an existing Trixie rootfs
+--------------------------------------
+  apt-get install ./nasty-engine_*.deb ./nasty-webui_*.deb ./nasty_*.deb
+  systemctl enable --now nasty-metrics nasty-engine
+  # Point Caddy at debian/Caddyfile.nasty or merge into /etc/caddy/Caddyfile
+
+Next ports
+----------
+  * Replace remaining bcachefs storage paths with btrfs (in progress)
+  * SMB uses ksmbd (`ksmbd.service`); AD / Time Machine removed
+  * WS-Discovery via `wsdd2` (full unit override binds to ksmbd, not Samba smbd)
+  * FTP / SFTP / S3 file serving via `rclone serve` (enable under Sharing)

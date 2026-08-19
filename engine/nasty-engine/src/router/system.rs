@@ -92,61 +92,10 @@ pub(super) async fn try_route(
         "system.operations.list" => ok(req, build_operations(state).await),
         "system.custom_config.get" => match custom_config_get().await {
             Ok(config) => ok(req, config),
-            Err(e) => err(req, format!("read /etc/nixos/custom.nix: {e}")),
+            Err(e) => err(req, format!("read /etc/nasty/custom.conf: {e}")),
         },
         "system.hardware.iommu" => ok(req, nasty_system::hardware::iommu_groups().await),
         "system.hardware.summary" => ok(req, nasty_system::hardware::system_summary().await),
-        "system.secure_boot.readiness" => ok(req, nasty_system::secure_boot::readiness().await),
-        "system.secure_boot.enrollment.status" => {
-            ok(req, state.secure_boot_enrollment.status().await)
-        }
-        "system.secure_boot.enrollment.begin" => {
-            if session.role != Role::Admin {
-                return Some(err(req, "admin only".to_string()));
-            }
-            match state.secure_boot_enrollment.begin(&session.username).await {
-                Ok(s) => ok(req, s),
-                Err(e) => err(req, e.to_string()),
-            }
-        }
-        "system.secure_boot.enrollment.abort" => {
-            if session.role != Role::Admin {
-                return Some(err(req, "admin only".to_string()));
-            }
-            let reason = str_param(req, "reason")
-                .unwrap_or("operator aborted")
-                .to_string();
-            match state
-                .secure_boot_enrollment
-                .abort(&session.username, &reason)
-                .await
-            {
-                Ok(s) => ok(req, s),
-                Err(e) => err(req, e.to_string()),
-            }
-        }
-        "system.secure_boot.enrollment.rebuild" => {
-            if session.role != Role::Admin {
-                return Some(err(req, "admin only".to_string()));
-            }
-            match state.secure_boot_enrollment.rebuild().await {
-                Ok(()) => ok(req, serde_json::json!({ "triggered": true })),
-                Err(e) => err(req, e.to_string()),
-            }
-        }
-        "system.secure_boot.enrollment.complete" => {
-            if session.role != Role::Admin {
-                return Some(err(req, "admin only".to_string()));
-            }
-            match state
-                .secure_boot_enrollment
-                .complete(&session.username)
-                .await
-            {
-                Ok(s) => ok(req, s),
-                Err(e) => err(req, e.to_string()),
-            }
-        }
         "system.rdma.status" => ok(req, nasty_system::rdma::status().await),
         "system.rdma.set" => match parse_params::<nasty_system::rdma::RdmaSetRequest>(req) {
             Ok(p) => {
@@ -300,8 +249,7 @@ pub(super) async fn try_route(
                 "nasty-metrics",
                 "caddy",
                 "nfs-server",
-                "samba-smbd",
-                "samba-nmbd",
+                "ksmbd",
                 "docker",
                 "sshd",
                 "avahi-daemon",
@@ -309,6 +257,7 @@ pub(super) async fn try_route(
                 "nut-driver",
                 "nut-server",
                 "nut-monitor",
+                "wsdd2",
             ];
             let mut available = Vec::new();
             for unit in units {
@@ -1023,10 +972,10 @@ async fn build_system_status(state: &AppState) -> (nasty_system::SystemStatus, u
     )
 }
 
-/// Read `/etc/nixos/custom.nix` for the read-only WebUI view. A missing file is
-/// the normal "not created yet" state; other I/O failures remain visible.
+/// Read optional operator overlay at `/etc/nasty/custom.conf` (Debian).
+/// Missing file is normal.
 async fn custom_config_get() -> std::io::Result<nasty_system::CustomConfig> {
-    const PATH: &str = "/etc/nixos/custom.nix";
+    const PATH: &str = "/etc/nasty/custom.conf";
     match tokio::fs::read_to_string(PATH).await {
         Ok(content) => Ok(nasty_system::CustomConfig {
             path: PATH.to_string(),

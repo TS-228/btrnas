@@ -235,7 +235,7 @@ mod tests {
     #[test]
     fn system_profiles_require_an_unscoped_admin() {
         let data = profile(&["/fs/tank/appdata"]);
-        let system = profile(&["/var/lib/nasty", "/etc/nixos"]);
+        let system = profile(&["/var/lib/nasty", "/etc/nasty"]);
 
         assert!(profile_access_error(&session(Role::Operator, false), &data).is_none());
         assert!(profile_access_error(&session(Role::Operator, false), &system).is_some());

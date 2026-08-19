@@ -83,10 +83,6 @@
 	let startingDevUpgrade = $state(false);
 	let taggedReleaseBanner: TaggedReleaseBannerState = $state({ kind: 'loading' });
 	let versionRows: VersionRow[] = $state([]);
-	/** bcachefs-tools ref this NASty build ships with (system.info). When
-	 * it differs from the pinned bcachefs row, we offer a one-click sync. */
-	let recommendedBcachefs = $state<string | null>(null);
-	let syncingBcachefs = $state(false);
 	let status: UpdateStatus | null = $state(null);
 	let loading = $state(true);
 	let startingSwitch = $state(false);
@@ -110,10 +106,8 @@
 	let firmwareLoading = $state(false);
 	let firmwareLoaded = $state(false);
 	let firmwareUpdating: Record<string, boolean> = $state({});
-	// Apply-side blockers (today: Secure Boot enforcing — upstream
-	// lanzaboote#591 breaks fwupd's EFI-capsule shim). Engine owns
-	// the reason string; we render it verbatim in the banner and
-	// tooltip so the wording stays consistent across surfaces.
+	// Apply-side blockers (e.g. firmware Secure Boot enforcing).
+	// Engine owns the reason string; we render it verbatim.
 	let firmwareConstraints: FirmwareConstraints | null = $state(null);
 
 	const phases = versionUpdatePhases;
@@ -214,6 +208,8 @@
 			case 'bcachefs-tools': return 'bcachefs-tools';
 			case 'tailscale-nixpkgs': return 'Tailscale package source';
 			case 'nasty': return 'nasty';
+			case 'debian': return 'Debian';
+			case 'kernel': return 'Kernel';
 			default: return name;
 		}
 	}
@@ -281,16 +277,14 @@
 
 	async function loadVersionPage() {
 		await withToast(async () => {
-			const [nextInfo, nextVersion, nextBuildDir, sys] = await Promise.all([
+			const [nextInfo, nextVersion, nextBuildDir] = await Promise.all([
 				client.call<VersionInfo>('system.version.get'),
 				client.call<UpdateInfo>('system.update.version'),
 				client.call<UpdateBuildDirConfig>('system.update.build_dir.get'),
-				client.call<{ bcachefs_recommended_ref: string | null }>('system.info').catch(() => null)
 			]);
 			info = nextVersion;
 			buildDir = nextBuildDir;
 			buildDirDraft = nextBuildDir.path ?? '';
-			recommendedBcachefs = sys?.bcachefs_recommended_ref ?? null;
 			syncVersionRows(nextInfo);
 			if (readVersionPageAction() === 'version-switch') {
 				taggedReleaseBanner = { kind: 'switching' };
@@ -339,14 +333,8 @@
 				} else {
 					writeVersionPageAction(null);
 					void loadTaggedReleaseBanner();
-					// The switch finished. A bcachefs-tools-only switch
-					// rebuilds + activates without restarting the engine, so
-					// the WS never drops and the layout's reconnect-driven
-					// sysInfo refresh never fires — the top-bar bcachefs chip
-					// would stay stale until a manual reload. Nudge it (with a
-					// few spaced retries, since a single fetch can race the
-					// just-settling rebuild), and reload our rows so the
-					// pinned ref / sync button update.
+					// Version switch can finish without restarting the engine;
+					// nudge the layout's cached sysInfo and reload our rows.
 					sysInfoRefresh.triggerReconcile();
 					void loadVersionPage();
 				}
@@ -399,33 +387,6 @@
 			void loadTaggedReleaseBanner();
 		}
 		startingSwitch = false;
-	}
-
-	// Offer a one-click bcachefs sync when the operator's pinned ref
-	// differs from the ref this NASty build ships with (#457-adjacent).
-	const bcachefsRow = $derived(versionRows.find((r) => r.name === 'bcachefs-tools'));
-	const bcachefsSyncAvailable = $derived(
-		!!recommendedBcachefs &&
-			!!bcachefsRow &&
-			trackingRef(bcachefsRow.initialUrl) !== recommendedBcachefs
-	);
-
-	async function syncBcachefsToBundled() {
-		const row = versionRows.find((r) => r.name === 'bcachefs-tools');
-		if (!recommendedBcachefs || !row) return;
-		if (
-			!(await confirm(
-				`Switch bcachefs to ${recommendedBcachefs}?`,
-				`This re-pins bcachefs-tools to ${recommendedBcachefs} — the version bundled with this NASty release — and rebuilds immediately. You may need to reboot afterward to load the new kernel module.`,
-				{ confirmLabel: 'Switch', cancelLabel: 'Cancel' }
-			))
-		)
-			return;
-		syncingBcachefs = true;
-		row.url = `github:koverstreet/bcachefs-tools/${recommendedBcachefs}`;
-		row.update = true;
-		await doVersionSwitch();
-		syncingBcachefs = false;
 	}
 
 	async function upgradeTaggedRelease() {
@@ -522,16 +483,8 @@
 						checkInfo = null; // clear stale "available" after upgrade
 						await loadVersionPage();
 						writeVersionPageAction(null);
-						// Nudge the layout's cached sysInfo so the top-bar
-						// bcachefs chip clears without a manual reload. The
-						// same nudge exists in loadStatus() for the
-						// came-back-to-the-page case, but when the operator
-						// sits here watching the rebuild, THIS branch detects
-						// completion — and a bcachefs-tools-only switch never
-						// restarts the engine, so the reconnect-driven refresh
-						// doesn't fire either. Reconcile (spaced retries), not
-						// a single trigger: the fetch can race the settling
-						// rebuild.
+						// Nudge the layout's cached sysInfo (footer versions)
+						// when a switch finishes without restarting the engine.
 						sysInfoRefresh.triggerReconcile();
 						if (status.state === 'success') {
 						if (status.webui_changed) refreshState.set();
@@ -782,12 +735,6 @@
 												{startingDevUpgrade ? 'Starting...' : 'Upgrade'}
 											</Button>
 										{/if}
-										{#if bcachefsSyncAvailable}
-											<Button size="sm" variant="secondary" onclick={syncBcachefsToBundled} disabled={syncingBcachefs || status?.state === 'running'}
-												title="Your bcachefs pin differs from the version bundled with this NASty release. Re-pin to it and rebuild.">
-												{syncingBcachefs ? 'Switching...' : `Sync bcachefs → ${recommendedBcachefs}`}
-											</Button>
-										{/if}
 									{:else if taggedReleaseBanner.kind === 'ready' && !taggedReleaseBanner.current_is_latest_standard_url}
 										<Button size="sm" onclick={upgradeTaggedRelease} disabled={startingUpgrade || status?.state === 'running'}>
 											{startingUpgrade ? 'Starting...' : 'Upgrade'}
@@ -845,69 +792,24 @@
 							<ChevronRight class="h-4 w-4 shrink-0 text-muted-foreground" />
 						{/if}
 						<div class="flex-1">
-							<div class="font-medium">Upstream</div>
-							<div class="text-xs text-muted-foreground">Edit live flake input URLs and rebuild from /etc/nixos.</div>
+							<div class="font-medium">Installed components</div>
+							<div class="text-xs text-muted-foreground">
+								Debian package versions (upgrades via apt + snapper snapshots).
+							</div>
 						</div>
 					</button>
 
 					{#if upstreamExpanded}
-						<div class="space-y-4 border-t border-border/60 p-4 {upstreamBusy ? 'pointer-events-none opacity-50' : ''}">
-							<div class="space-y-3">
-								{#each versionRows as row}
-									<div class="rounded-lg border border-border/60 p-4">
-										<div class="mb-2 flex items-center justify-between gap-3">
-											<div class="font-medium">{row.label}</div>
-											<div class="flex items-center gap-2 text-xs">
-												<span class="text-muted-foreground">locked</span>
-												<Badge variant="secondary" class="font-mono">{pinnedLabel(row.tag, row.rev)}</Badge>
-											</div>
-										</div>
-										<div class="flex flex-col gap-3 lg:flex-row lg:items-center">
-											<div class="flex-1">
-												<Input
-													bind:value={row.url}
-													disabled={startingSwitch || status?.state === 'running'}
-													class="font-mono text-sm"
-												/>
-											</div>
-											<label class="flex items-center gap-2 text-sm text-muted-foreground lg:w-28 lg:justify-end">
-												<input
-													type="checkbox"
-													checked={row.update || isForcedVersionUpdate(row)}
-													disabled={startingSwitch || status?.state === 'running' || isForcedVersionUpdate(row)}
-													onchange={(event) => {
-														row.update = (event.currentTarget as HTMLInputElement).checked;
-													}}
-													class="h-4 w-4 rounded border-input"
-												/>
-												<span>Update</span>
-											</label>
-										</div>
-										{#if row.name === 'tailscale-nixpkgs'}
-											<p class="mt-2 text-xs text-muted-foreground">
-												Tailscale cannot self-update on NixOS. Refreshing this input installs the latest cached package through an atomic system generation.
-											</p>
-										{/if}
-									</div>
-								{/each}
-							</div>
-
-							<div class="flex flex-wrap items-center justify-between gap-3">
-								<p class="text-xs text-muted-foreground">
-									{#if versionSelectionCount > 0}
-										{versionSelectionCount} input{versionSelectionCount === 1 ? '' : 's'} selected for refresh.
-									{:else}
-										No refresh selected yet.
-									{/if}
-								</p>
-								<Button
-									size="sm"
-									onclick={requestVersionSwitch}
-									disabled={!versionDirty || startingSwitch || status?.state === 'running'}
-								>
-									{startingSwitch ? 'Starting...' : 'Switch'}
-								</Button>
-							</div>
+						<div class="space-y-3 border-t border-border/60 p-4">
+							{#each versionRows as row}
+								<div class="flex items-center justify-between gap-3 rounded-lg border border-border/60 p-4">
+									<div class="font-medium">{row.label}</div>
+									<Badge variant="secondary" class="font-mono">{pinnedLabel(row.tag, row.rev)}</Badge>
+								</div>
+							{/each}
+							<p class="text-xs text-muted-foreground">
+								Use <strong>Upgrade</strong> above to run apt. Generations are snapper btrfs snapshots of <code class="font-mono">/</code>.
+							</p>
 						</div>
 					{/if}
 				</div>
@@ -1027,8 +929,10 @@
 			<CardContent class="py-5">
 				<div class="mb-4 flex items-center justify-between">
 					<div>
-						<h2 class="text-base font-semibold">System Generations</h2>
-						<p class="text-xs text-muted-foreground">Each successful rebuild creates a new generation. Switch back to any previous version or label known-good configurations.</p>
+						<h2 class="text-base font-semibold">System Generations (snapper)</h2>
+						<p class="text-sm text-muted-foreground">
+							Btrfs snapshots of <code class="font-mono">/</code>. Switching runs snapper rollback — reboot to boot the restored subvolume.
+						</p>
 					</div>
 					<div class="flex items-center gap-2">
 						{#if availableLabels.length > 0}
@@ -1220,10 +1124,6 @@
 					</div>
 
 					{#if firmwareConstraints?.sb_blocks_apply}
-						<!-- Apply path is broken under Secure Boot (upstream
-							 lanzaboote#591). Listing + check still work, so
-							 the table renders normally; only the Apply button
-							 is replaced with a tooltip explaining why. -->
 						<div class="mb-4 rounded border border-amber-700/40 bg-amber-950/40 px-3 py-2 text-xs text-amber-200">
 							<strong>Firmware apply is blocked.</strong>
 							<div class="mt-1">{firmwareConstraints.sb_blocks_apply_reason}</div>

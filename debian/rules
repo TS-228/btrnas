@@ -1,0 +1,79 @@
+#!/usr/bin/make -f
+
+export DH_VERBOSE = 1
+export CARGO_HOME = $(CURDIR)/debian/cargo-home
+# Bake package version into the engine when git metadata is unavailable.
+export NASTY_GIT_SHA ?= $(shell dpkg-parsechangelog -S Version | cut -d- -f1)
+
+# Cross builds: set DEB_HOST_RUST_TARGET (e.g. armv7-unknown-linux-gnueabihf).
+DEB_HOST_GNU_TYPE ?= $(shell dpkg-architecture -qDEB_HOST_GNU_TYPE)
+DEB_HOST_ARCH ?= $(shell dpkg-architecture -qDEB_HOST_ARCH)
+
+ifeq ($(DEB_HOST_ARCH),armhf)
+  RUST_TARGET ?= armv7-unknown-linux-gnueabihf
+else ifeq ($(DEB_HOST_ARCH),arm64)
+  RUST_TARGET ?= aarch64-unknown-linux-gnu
+else ifeq ($(DEB_HOST_ARCH),amd64)
+  RUST_TARGET ?= x86_64-unknown-linux-gnu
+else
+  RUST_TARGET ?=
+endif
+
+CARGO_BUILD_FLAGS = --release --locked --manifest-path $(CURDIR)/engine/Cargo.toml
+ifneq ($(RUST_TARGET),)
+  ifneq ($(DEB_BUILD_GNU_TYPE),$(DEB_HOST_GNU_TYPE))
+    CARGO_BUILD_FLAGS += --target $(RUST_TARGET)
+    ENGINE_BIN_DIR = engine/target/$(RUST_TARGET)/release
+  else
+    ENGINE_BIN_DIR = engine/target/release
+  endif
+else
+  ENGINE_BIN_DIR = engine/target/release
+endif
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	mkdir -p $(CARGO_HOME)
+	# Ensure rust target exists when cross-compiling.
+ifneq ($(RUST_TARGET),)
+	rustup target add $(RUST_TARGET) 2>/dev/null || true
+endif
+
+override_dh_auto_build:
+	cargo build $(CARGO_BUILD_FLAGS) -p nasty-engine -p nasty-metrics
+	cd webui && npm ci && npm run build
+
+override_dh_auto_test:
+	@echo "Skipping upstream test suite during package build"
+
+override_dh_auto_install:
+	install -d debian/nasty-engine/usr/bin
+	install -m 0755 $(ENGINE_BIN_DIR)/nasty-engine debian/nasty-engine/usr/bin/
+	install -m 0755 $(ENGINE_BIN_DIR)/nasty-metrics debian/nasty-engine/usr/bin/
+	install -d debian/nasty-engine/usr/lib/systemd/system
+	install -m 0644 debian/nasty-engine.service debian/nasty-engine/usr/lib/systemd/system/
+	install -m 0644 debian/nasty-metrics.service debian/nasty-engine/usr/lib/systemd/system/
+	install -m 0644 debian/nasty-rclone@.service debian/nasty-engine/usr/lib/systemd/system/
+	# Full unit override: stock wsdd2 BindsTo=smbd; drop-ins cannot clear that.
+	install -d debian/nasty-engine/etc/systemd/system
+	install -m 0644 debian/wsdd2-ksmbd.service \
+		debian/nasty-engine/etc/systemd/system/wsdd2.service
+	install -d debian/nasty-engine/etc/nasty
+	printf '%s\n' "$(NASTY_GIT_SHA)" > debian/nasty-engine/etc/nasty-version
+	install -d debian/nasty-webui/usr/share/nasty-webui
+	cp -a webui/build/. debian/nasty-webui/usr/share/nasty-webui/
+	install -d debian/nasty/etc/apt/apt.conf.d
+	install -m 0644 debian/apt-snapper.conf debian/nasty/etc/apt/apt.conf.d/80nasty-snapper
+	install -d debian/nasty/usr/share/nasty
+	install -m 0755 debian/apt-snapper.sh debian/nasty/usr/share/nasty/apt-snapper.sh
+	install -m 0644 debian/nasty-firewall-baseline.nft debian/nasty/usr/share/nasty/firewall-baseline.nft
+	install -d debian/nasty/etc/caddy
+	install -m 0644 debian/Caddyfile debian/nasty/etc/caddy/Caddyfile.nasty
+	install -d debian/nasty/usr/share/doc/nasty
+	install -m 0644 debian/README.Debian debian/nasty/usr/share/doc/nasty/README.Debian
+
+override_dh_dwz:
+	# Skip dwz on large Rust binaries (often fails / saves little).
+	@true

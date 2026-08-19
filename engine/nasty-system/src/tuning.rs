@@ -6,7 +6,7 @@ use tracing::{info, warn};
 
 const STATE_PATH: &str = "/var/lib/nasty/tuning.json";
 const STATE_DIR: &str = "/var/lib/nasty";
-const SMB_TUNING_CONF: &str = "/etc/samba/nasty-tuning.conf";
+const KSMBD_CONF: &str = "/etc/ksmbd/ksmbd.conf";
 
 // ── Structs ──────────────────────────────────────────────────
 
@@ -31,7 +31,7 @@ pub struct TuningConfig {
     /// Minutes before idle SMB clients are disconnected (0 = never).
     #[serde(default)]
     pub smb_deadtime: u32,
-    /// Samba socket options for TCP tuning (e.g. `SO_RCVBUF=131072 SO_SNDBUF=131072`).
+    /// Samba socket options (ignored on ksmbd; retained for API compatibility).
     #[serde(default)]
     pub smb_socket_options: String,
 
@@ -352,32 +352,89 @@ async fn apply_sysctl(key: &str, value: u32) -> Result<(), String> {
 }
 
 async fn apply_smb_tuning(config: &TuningConfig) -> Result<(), String> {
-    // Build a Samba config fragment with tuning parameters
-    let mut lines = vec!["[global]".to_string()];
-    if config.smb_max_connections > 0 {
-        lines.push(format!(
-            "   max connections = {}",
-            config.smb_max_connections
-        ));
-    }
-    if config.smb_deadtime > 0 {
-        lines.push(format!("   deadtime = {}", config.smb_deadtime));
-    }
-    if !config.smb_socket_options.is_empty() {
-        lines.push(format!("   socket options = {}", config.smb_socket_options));
-    }
-    lines.push(String::new()); // trailing newline
+    // ksmbd has no separate include file — merge knobs into the live
+    // monolithic conf via the sharing crate's rewrite path when possible,
+    // otherwise patch [global] in place for max connections / deadtime.
+    let path = std::path::Path::new(KSMBD_CONF);
+    let existing = tokio::fs::read_to_string(path).await.unwrap_or_else(|_| {
+        "# Managed by NASty — do not edit manually\n\n[global]\n    workgroup = WORKGROUP\n    server string = NASty\n".to_string()
+    });
 
-    tokio::fs::write(SMB_TUNING_CONF, lines.join("\n"))
+    let mut lines: Vec<String> = Vec::new();
+    let mut in_global = false;
+    let mut saw_global = false;
+    for line in existing.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_global = trimmed.eq_ignore_ascii_case("[global]");
+            if in_global {
+                saw_global = true;
+            }
+            lines.push(line.to_string());
+            continue;
+        }
+        if in_global
+            && (trimmed.starts_with("max connections")
+                || trimmed.starts_with("deadtime")
+                || trimmed.starts_with("socket options"))
+        {
+            continue;
+        }
+        lines.push(line.to_string());
+    }
+
+    if !saw_global {
+        lines.insert(0, "[global]".to_string());
+        in_global = true;
+        let _ = in_global;
+    }
+
+    // Re-insert knobs after the [global] header.
+    let mut out = Vec::new();
+    let mut injected = false;
+    for line in lines {
+        out.push(line.clone());
+        if !injected && line.trim().eq_ignore_ascii_case("[global]") {
+            if config.smb_max_connections > 0 {
+                out.push(format!(
+                    "    max connections = {}",
+                    config.smb_max_connections
+                ));
+            }
+            if config.smb_deadtime > 0 {
+                out.push(format!("    deadtime = {}", config.smb_deadtime));
+            }
+            injected = true;
+        }
+    }
+    if !injected {
+        out.push("[global]".to_string());
+        if config.smb_max_connections > 0 {
+            out.push(format!(
+                "    max connections = {}",
+                config.smb_max_connections
+            ));
+        }
+        if config.smb_deadtime > 0 {
+            out.push(format!("    deadtime = {}", config.smb_deadtime));
+        }
+    }
+    out.push(String::new());
+
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| format!("failed to create {}: {e}", parent.display()))?;
+    }
+    tokio::fs::write(path, out.join("\n"))
         .await
-        .map_err(|e| format!("failed to write {SMB_TUNING_CONF}: {e}"))?;
+        .map_err(|e| format!("failed to write {KSMBD_CONF}: {e}"))?;
 
-    // Reload Samba config (non-fatal if smbd isn't running). `try_run`
-    // logs the "smbd not running" error at warn! so we still see it in
-    // the journal if reload was actually expected to take effect.
-    nasty_common::cmd::try_run("smbcontrol", &["smbd", "reload-config"]).await;
+    // socket options are Samba-only — ignored for ksmbd.
+    let _ = &config.smb_socket_options;
 
-    info!("SMB tuning config written and reload requested");
+    nasty_common::cmd::try_run("ksmbd.control", &["--reload"]).await;
+    info!("ksmbd tuning applied and reload requested");
     Ok(())
 }
 

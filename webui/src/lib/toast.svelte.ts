@@ -1,5 +1,6 @@
 /** Toast notification store */
 
+import { untrack } from 'svelte';
 import { getSessionGeneration, registerSessionReset } from './client';
 
 type ToastType = 'success' | 'error' | 'info';
@@ -60,7 +61,13 @@ export async function withToast<T>(
 	successMsg?: string
 ): Promise<T | undefined> {
 	const generation = getSessionGeneration();
-	_busy++;
+	// `_busy++` both reads and writes `$state`. Effects that call withToast
+	// (open-panel loads) must not track that, or they re-fire on every
+	// increment while the RPC is still in flight and the busy bar never
+	// settles.
+	untrack(() => {
+		_busy++;
+	});
 	try {
 		const result = await fn();
 		if (successMsg && generation === getSessionGeneration()) success(successMsg);
@@ -70,7 +77,11 @@ export async function withToast<T>(
 		if (generation === getSessionGeneration()) error(msg);
 		return undefined;
 	} finally {
-		if (generation === getSessionGeneration()) _busy--;
+		if (generation === getSessionGeneration()) {
+			untrack(() => {
+				_busy--;
+			});
+		}
 	}
 }
 

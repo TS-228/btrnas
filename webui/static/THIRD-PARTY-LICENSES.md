@@ -89,7 +89,7 @@ All dependencies use licenses compatible with GPL-3.0.
 | pciutils | GPL-2.0 |
 | qemu | GPL-2.0 |
 | rsync | GPL-3.0 |
-| samba | GPL-3.0 |
+| ksmbd-tools | GPL-2.0 |
 | smartmontools | GPL-2.0 |
 | targetcli-fb | Apache-2.0 |
 | tcpdump | BSD-3-Clause |

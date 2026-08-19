@@ -680,7 +680,7 @@ impl SettingsService {
         if let Some(name) = update.hostname {
             apply_hostname(&name).await?;
             settings.hostname = Some(name);
-            // avahi-daemon and samba-wsdd announce the *old* hostname
+            // avahi-daemon (and optional wsdd) announce the *old* hostname
             // until restarted — they don't pick up the live kernel
             // hostname change, so the box vanishes from file-manager
             // network views (announced under a name that no longer
@@ -913,46 +913,32 @@ pub async fn list_timezones() -> Result<Vec<String>, String> {
 }
 
 async fn apply_hostname(name: &str) -> Result<(), String> {
-    // NixOS has /etc as read-only — set the kernel hostname via /proc.
-    // Persistence is via /var/lib/nasty/settings.json, read at boot by
-    // nasty-apply-hostname.service.
-    tokio::fs::write("/proc/sys/kernel/hostname", name.as_bytes())
-        .await
-        .map_err(|e| format!("failed to set kernel hostname: {e}"))?;
-
-    // Also expose the name to the wrapper flake so `nixos-rebuild
-    // switch` (which defaults to looking up `nixosConfigurations.<kernel-hostname>`)
-    // resolves to our system. The flake at /etc/nixos/flake.nix imports
-    // ./hostname.nix when present and falls back to "nasty" otherwise,
-    // so writing this file is best-effort — failures are logged but
-    // don't fail the apply (e.g. fresh installs before rebootstrap, or
-    // if /etc/nixos isn't writable for some reason).
-    write_hostname_nix(name).await;
-
+    // Debian: prefer hostnamectl (writes /etc/hostname + sets kernel name).
+    // Fall back to /proc if hostnamectl is unavailable.
+    let hc = tokio::process::Command::new("hostnamectl")
+        .args(["set-hostname", name])
+        .status()
+        .await;
+    match hc {
+        Ok(st) if st.success() => {}
+        _ => {
+            tokio::fs::write("/proc/sys/kernel/hostname", name.as_bytes())
+                .await
+                .map_err(|e| format!("failed to set kernel hostname: {e}"))?;
+            let _ = tokio::fs::write("/etc/hostname", format!("{name}\n")).await;
+        }
+    }
+    // Best-effort legacy NixOS overlay removed on Debian.
     Ok(())
 }
 
-/// Write `/etc/nixos/hostname.nix` with the current hostname as a Nix
-/// string literal. Read by the wrapper flake to alias
-/// `nixosConfigurations.<hostname>` to the same system attr as `nasty`.
-async fn write_hostname_nix(name: &str) {
-    let nixos_dir = std::path::Path::new("/etc/nixos");
-    if !nixos_dir.exists() {
-        // Fresh install before rebootstrap, or running outside a normal
-        // NixOS layout (tests). Nothing to do.
-        return;
-    }
-    let path = nixos_dir.join("hostname.nix");
-    let content = format!("{}\n", to_nix_string(name));
-    if let Err(e) = tokio::fs::write(&path, content).await {
-        warn!("could not write {}: {e}", path.display());
-    }
-}
+/// Read `/etc/nixos/hostname.nix` removed — hostnamectl handles persistence.
 
 /// Render a Rust string as a Nix double-quoted string literal, escaping
 /// the characters that have special meaning inside `"..."`. The hostname
 /// has been validated upstream (RFC1123-ish), but escape defensively so
 /// any future relaxation can't smuggle Nix syntax into the flake.
+#[cfg(test)]
 fn to_nix_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');

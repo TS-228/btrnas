@@ -13,6 +13,9 @@ export function summarizeDependents(deps: FsDependents): string | null {
 		{ label: 'backup job', items: deps.backup_jobs },
 		{ label: 'NFS share', items: deps.nfs_shares },
 		{ label: 'SMB share', items: deps.smb_shares },
+		{ label: 'FTP share', items: deps.ftp_shares },
+		{ label: 'SFTP share', items: deps.sftp_shares },
+		{ label: 'S3 share', items: deps.s3_shares },
 		{ label: 'iSCSI target', items: deps.iscsi_targets },
 		{ label: 'NVMe-oF subsystem', items: deps.nvmeof_subsystems },
 	];

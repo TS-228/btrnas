@@ -37,6 +37,9 @@ pub struct SubvolumeDependents {
     pub backup_jobs: Vec<String>,
     pub nfs_shares: Vec<String>,
     pub smb_shares: Vec<String>,
+    pub ftp_shares: Vec<String>,
+    pub sftp_shares: Vec<String>,
+    pub s3_shares: Vec<String>,
     pub iscsi_targets: Vec<String>,
     pub nvmeof_subsystems: Vec<String>,
     pub state_errors: Vec<String>,
@@ -175,6 +178,34 @@ pub async fn find_all_subvolume_dependents(state: &AppState) -> Vec<SubvolumeDep
                 && let Some(deps) = by_path.get_mut(p)
             {
                 deps.smb_shares.push(s.name);
+            }
+        }
+    }
+
+    if let Ok(shares) = state.ftp.list().await {
+        for s in shares {
+            if let Some(p) = owning_subvol(&paths_desc, &s.path)
+                && let Some(deps) = by_path.get_mut(p)
+            {
+                deps.ftp_shares.push(s.name);
+            }
+        }
+    }
+    if let Ok(shares) = state.sftp.list().await {
+        for s in shares {
+            if let Some(p) = owning_subvol(&paths_desc, &s.path)
+                && let Some(deps) = by_path.get_mut(p)
+            {
+                deps.sftp_shares.push(s.name);
+            }
+        }
+    }
+    if let Ok(shares) = state.s3.list().await {
+        for s in shares {
+            if let Some(p) = owning_subvol(&paths_desc, &s.path)
+                && let Some(deps) = by_path.get_mut(p)
+            {
+                deps.s3_shares.push(s.name);
             }
         }
     }
@@ -336,6 +367,9 @@ mod tests {
             "backup_jobs",
             "nfs_shares",
             "smb_shares",
+            "ftp_shares",
+            "sftp_shares",
+            "s3_shares",
             "iscsi_targets",
             "nvmeof_subsystems",
         ] {

@@ -1,0 +1,24 @@
+[Unit]
+Description=NASty Engine
+Documentation=https://github.com/nasty-project/nasty
+After=network-online.target nftables.service nasty-metrics.service
+Wants=network-online.target nasty-metrics.service
+# nftables is recommended but must not hard-fail the engine on minimal images.
+Wants=nftables.service
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/nasty-engine
+Restart=always
+RestartSec=5
+StateDirectory=nasty
+Environment=RUST_LOG=info
+Environment=NASTY_WEBUI_ROOT=/usr/share/nasty-webui
+Nice=-5
+# Engine manages mounts/services; keep namespace hardening off.
+LimitNOFILE=65535
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target

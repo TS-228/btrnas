@@ -16,16 +16,13 @@
 	import { confirm } from '$lib/confirm.svelte';
 	import { sysInfoRefresh } from '$lib/sysInfoRefresh.svelte';
 	import { uiPrefs } from '$lib/uiPrefs.svelte';
-	import { domain, domainRefresh, domainJoin, domainLeave } from '$lib/domain.svelte';
-	import { dc, dcRefresh, dcProvision } from '$lib/dc.svelte';
-	import DcPanel from '$lib/directory/DcPanel.svelte';
 	import type { Settings, SystemInfo, CustomConfig, NetworkState, NetworkConfig, LiveInterface, TuningConfig, NetIfStats, IpConfig, InterfaceConfig, VfConfig } from '$lib/types';
 	import { Button } from '$lib/components/ui/button';
 	import { Badge } from '$lib/components/ui/badge';
 	import BridgeCreator from '$lib/components/BridgeCreator.svelte';
 	import { Copy, Check, ChevronDown, ChevronRight } from '@lucide/svelte';
 
-	let activeTab: 'general' | 'directory' | 'network' | 'notifications' | 'metrics' | 'tuning' = $state('general');
+	let activeTab: 'general' | 'network' | 'notifications' | 'metrics' | 'tuning' = $state('general');
 
 	// Notifications tab
 	import type { NotificationConfig, NotificationChannel } from '$lib/types';
@@ -190,37 +187,6 @@
 	// Telemetry
 	let sendingTelemetry = $state(false);
 
-	// Directory (Active Directory)
-	let domainJoinTried = $state(false);
-	let domainAdvanced = $state(false);
-	let domainLeaveOpen = $state(false);
-	let domainLeaveForce = $state(false);
-	let domainLeaveUsername = $state('');
-	let domainLeavePassword = $state('');
-
-	async function domainJoinGuarded() {
-		if (!domain.realm || !domain.username || !domain.password) { domainJoinTried = true; return; }
-		domainJoinTried = false;
-		await domainJoin();
-	}
-
-	// Directory (Active Directory) — host-a-new-domain form
-	let dcProvisionTried = $state(false);
-
-	async function dcProvisionGuarded() {
-		if (!dc.realm || !dc.adminPassword) { dcProvisionTried = true; return; }
-		dcProvisionTried = false;
-		await dcProvision();
-	}
-
-	async function domainLeaveConfirmed() {
-		await domainLeave(domainLeaveForce, domainLeaveUsername, domainLeavePassword);
-		domainLeaveOpen = false;
-		domainLeaveForce = false;
-		domainLeaveUsername = '';
-		domainLeavePassword = '';
-	}
-
 	// ── Metrics tab state ───────────────────────────────────
 	let metricsText = $state('');
 	let metricsLoading = $state(false);
@@ -243,14 +209,14 @@
 			if (line.startsWith('# HELP ')) {
 				const metricName = line.slice(7).split(' ')[0];
 				let title: string;
-				if (metricName.startsWith('nasty_bcachefs_device_')) {
-					title = 'bcachefs — Devices';
+				if (metricName.startsWith('nasty_btrfs_') || metricName.startsWith('nasty_bcachefs_device_')) {
+					title = 'Storage — Devices';
 				} else if (metricName.startsWith('nasty_bcachefs_time_stat_')) {
-					title = 'bcachefs — Time Stats';
+					title = 'Storage — Time Stats';
 				} else if (metricName.startsWith('nasty_bcachefs_counter')) {
-					title = 'bcachefs — Counters';
-				} else if (metricName.startsWith('nasty_bcachefs_')) {
-					title = 'bcachefs — Filesystem';
+					title = 'Storage — Counters';
+				} else if (metricName.startsWith('nasty_bcachefs_') || metricName.startsWith('nasty_btrfs_')) {
+					title = 'Storage — Filesystem';
 				} else if (metricName.startsWith('nasty_disk_smart_') || metricName.startsWith('nasty_disk_temperature') || metricName.startsWith('nasty_disk_power_on')) {
 					title = 'Disk Health (SMART)';
 				} else if (metricName.startsWith('nasty_disk_')) {
@@ -307,7 +273,6 @@
 			}
 			syncNetworkForm();
 		});
-		await Promise.all([domainRefresh(), dcRefresh()]);
 	});
 
 	function syncNetworkForm() {
@@ -779,12 +744,6 @@
 			: 'text-muted-foreground hover:text-foreground'}"
 	>General</button>
 	<button
-		onclick={() => switchTab('directory')}
-		class="px-4 py-2 text-sm font-medium transition-colors {activeTab === 'directory'
-			? 'border-b-2 border-primary text-foreground'
-			: 'text-muted-foreground hover:text-foreground'}"
-	>Directory</button>
-	<button
 		onclick={() => switchTab('network')}
 		class="px-4 py-2 text-sm font-medium transition-colors {activeTab === 'network'
 			? 'border-b-2 border-primary text-foreground'
@@ -908,13 +867,9 @@
 				<section class="rounded-lg border border-border p-5">
 					<h2 class="mb-2 text-base font-semibold">Custom configuration <span class="ml-1 align-middle text-xs font-normal text-muted-foreground">advanced</span></h2>
 					<p class="mb-4 text-sm text-muted-foreground">
-						Settings the WebUI doesn't expose go in
-						<code class="rounded bg-muted px-1 py-0.5 text-xs">/etc/nixos/custom.nix</code> — any NixOS
-						options, extra packages, or systemd units. NASty never overwrites this file, so it survives
-						reboots and upgrades. Edit it from the terminal, then run
-						<code class="break-all rounded bg-muted px-1 py-0.5 text-xs">nixos-rebuild switch --flake /etc/nixos#nasty</code>.
-						A broken file fails the rebuild safely; use
-						<code class="rounded bg-muted px-1 py-0.5 text-xs">lib.mkForce</code> when overriding a value NASty already sets.
+						Optional operator notes/config live in
+						<code class="rounded bg-muted px-1 py-0.5 text-xs">/etc/nasty/custom.conf</code>.
+						NASty never overwrites this file. Edit it from the terminal on Debian.
 					</p>
 					{#if !customConfigLoaded}
 						<p class="text-xs text-muted-foreground">Loading custom configuration...</p>
@@ -926,16 +881,15 @@
 						<pre class="max-h-80 overflow-auto rounded-md border border-border bg-secondary/20 p-3 font-mono text-xs whitespace-pre">{customConfig.content}</pre>
 					{:else}
 						<p class="text-xs text-muted-foreground italic">
-							Not created yet — <code class="rounded bg-muted px-1 py-0.5">custom.nix</code> doesn't exist.
-							Create it from a terminal to add custom config.
+							Not created yet — <code class="rounded bg-muted px-1 py-0.5">/etc/nasty/custom.conf</code> doesn't exist.
 						</p>
 					{/if}
 					<div class="mt-3">
 						<a
-							href={`/terminal?cmd=${encodeURIComponent('cd /etc/nixos')}`}
+							href={`/terminal?cmd=${encodeURIComponent('cd /etc/nasty')}`}
 							class="inline-flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-sm hover:bg-muted"
 						>
-							Open a terminal in /etc/nixos
+							Open a terminal in /etc/nasty
 						</a>
 					</div>
 				</section>
@@ -1015,7 +969,7 @@
 						checked={!uiPrefs.logoHidden}
 						onchange={(e) => uiPrefs.setLogoHidden(!(e.currentTarget as HTMLInputElement).checked)}
 					/>
-					Show the NASty logo in the sidebar
+					Show the btrNAS logo in the sidebar
 				</label>
 				<p class="mt-1 text-xs text-muted-foreground">Hiding the logo frees vertical space for the menu. You can also hide it from the small icon next to the logo.</p>
 
@@ -1068,191 +1022,6 @@
 		</div>
 	{/if}
 
-
-{:else if activeTab === 'directory'}
-
-	<div class="max-w-5xl">
-		<!-- Directory (Active Directory) -->
-		<section class="rounded-lg border border-border p-5">
-			<h2 class="mb-4 text-base font-semibold">Directory (Active Directory) <span class="ml-1 align-middle text-xs font-normal text-amber-400">experimental</span></h2>
-
-			{#if domain.loading || dc.loading}
-				<p class="text-sm text-muted-foreground">Loading...</p>
-			{:else if dc.status?.hosting}
-				<DcPanel />
-			{:else if domain.status?.joined}
-				<div class="mb-3 flex items-center justify-between">
-					<span class="text-sm text-muted-foreground">Realm</span>
-					<span class="text-sm font-medium font-mono">{domain.status.realm ?? '—'}</span>
-				</div>
-				<div class="mb-4 flex items-center justify-between">
-					<span class="text-sm text-muted-foreground">Workgroup</span>
-					<span class="text-sm font-medium font-mono">{domain.status.workgroup ?? '—'}</span>
-				</div>
-
-				<div class="mb-4 flex flex-wrap gap-1.5">
-					<Badge
-						variant={domain.status.trust_ok ? 'default' : domain.status.trust_ok === false ? 'destructive' : 'secondary'}
-						class="text-[0.65rem]"
-					>Trust: {domain.status.trust_ok ? 'OK' : domain.status.trust_ok === false ? 'Broken' : 'Unknown'}</Badge>
-					<Badge
-						variant={domain.status.dc_reachable ? 'default' : domain.status.dc_reachable === false ? 'destructive' : 'secondary'}
-						class="text-[0.65rem]"
-					>DC: {domain.status.dc_reachable ? 'Reachable' : domain.status.dc_reachable === false ? 'Unreachable' : 'Unknown'}</Badge>
-					<Badge
-						variant="outline"
-						class="text-[0.65rem] {Math.abs(domain.status.clock_skew_seconds ?? 0) > 120 ? 'border-amber-500/40 bg-amber-500/10 text-amber-400' : ''}"
-					>Clock skew: {domain.status.clock_skew_seconds ?? 0}s</Badge>
-				</div>
-
-				{#if !domainLeaveOpen}
-					<Button size="sm" variant="destructive" onclick={() => domainLeaveOpen = true}>Leave Domain</Button>
-				{:else}
-					<div class="space-y-3 rounded-md border border-border p-3">
-						<div class="flex w-fit rounded-md border border-border text-xs">
-							<button
-								onclick={() => domainLeaveForce = false}
-								class="rounded-l-md px-3 py-1 font-medium transition-colors {!domainLeaveForce ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:bg-accent'}"
-							>With credentials</button>
-							<button
-								onclick={() => domainLeaveForce = true}
-								class="rounded-r-md px-3 py-1 font-medium transition-colors {domainLeaveForce ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:bg-accent'}"
-							>Force local</button>
-						</div>
-						{#if !domainLeaveForce}
-							<div>
-								<label for="domain-leave-user" class="text-xs text-muted-foreground">Username</label>
-								<input
-									id="domain-leave-user"
-									type="text"
-									bind:value={domainLeaveUsername}
-									placeholder="Administrator"
-									class="mt-1 w-full rounded-md border border-input bg-background px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-								/>
-							</div>
-							<div>
-								<label for="domain-leave-pass" class="text-xs text-muted-foreground">Password</label>
-								<input
-									id="domain-leave-pass"
-									type="password"
-									bind:value={domainLeavePassword}
-									class="mt-1 w-full rounded-md border border-input bg-background px-2 py-1 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-								/>
-							</div>
-						{:else}
-							<p class="text-xs text-amber-500">Local-only leave: the computer account stays behind in AD until an admin removes it manually.</p>
-						{/if}
-						<div class="flex gap-2">
-							<Button size="sm" variant="destructive" onclick={domainLeaveConfirmed}>Confirm Leave</Button>
-							<Button size="sm" variant="secondary" onclick={() => { domainLeaveOpen = false; domainLeaveForce = false; domainLeaveUsername = ''; domainLeavePassword = ''; }}>Cancel</Button>
-						</div>
-					</div>
-				{/if}
-			{:else}
-				<div class="grid grid-cols-1 gap-8 lg:grid-cols-2">
-				<div>
-				<h3 class="mb-3 text-sm font-semibold">Join an existing domain</h3>
-				<div class="mb-3">
-					<label for="domain-realm" class="text-sm text-muted-foreground">Realm {#if !domain.realm && domainJoinTried}<span class="text-xs font-normal text-amber-500">required</span>{/if}</label>
-					<input
-						id="domain-realm"
-						type="text"
-						bind:value={domain.realm}
-						placeholder="corp.example.com"
-						class="mt-1 w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring {requiredFieldCls(!domain.realm, domainJoinTried)}"
-					/>
-				</div>
-				<div class="mb-3">
-					<label for="domain-username" class="text-sm text-muted-foreground">Username {#if !domain.username && domainJoinTried}<span class="text-xs font-normal text-amber-500">required</span>{/if}</label>
-					<input
-						id="domain-username"
-						type="text"
-						bind:value={domain.username}
-						placeholder="Administrator"
-						class="mt-1 w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring {requiredFieldCls(!domain.username, domainJoinTried)}"
-					/>
-				</div>
-				<div class="mb-3">
-					<label for="domain-password" class="text-sm text-muted-foreground">Password {#if !domain.password && domainJoinTried}<span class="text-xs font-normal text-amber-500">required</span>{/if}</label>
-					<input
-						id="domain-password"
-						type="password"
-						bind:value={domain.password}
-						class="mt-1 w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring {requiredFieldCls(!domain.password, domainJoinTried)}"
-					/>
-				</div>
-
-				<button
-					type="button"
-					onclick={() => domainAdvanced = !domainAdvanced}
-					class="mb-3 flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
-				>
-					{#if domainAdvanced}<ChevronDown class="h-3 w-3" />{:else}<ChevronRight class="h-3 w-3" />{/if}
-					Advanced
-				</button>
-				{#if domainAdvanced}
-					<div class="mb-3">
-						<label for="domain-ou" class="text-sm text-muted-foreground">Organizational Unit</label>
-						<input
-							id="domain-ou"
-							type="text"
-							bind:value={domain.ou}
-							placeholder="OU=Servers,DC=corp,DC=example,DC=com"
-							class="mt-1 w-full rounded-md border border-input bg-background px-3 py-1.5 font-mono text-xs focus:outline-none focus:ring-2 focus:ring-ring"
-						/>
-					</div>
-				{/if}
-
-				<Button size="sm" onclick={domainJoinGuarded} disabled={domain.joining}>
-					{domain.joining ? 'Joining… (this contacts the domain controller)' : 'Join'}
-				</Button>
-
-				</div>
-				<div class="lg:border-l lg:border-border lg:pl-8">
-				<h3 class="mb-3 text-sm font-semibold">Host a new domain</h3>
-				<p class="mb-3 text-sm text-muted-foreground">
-					This NASty becomes the Active Directory domain controller — clients and other NASty boxes join the domain it hosts. One DC per domain; back it up from this panel. Clients should use this box as their DNS server. Advanced administration (OUs, GPOs) works with Windows RSAT.
-				</p>
-				<div class="mb-4 rounded border border-amber-700/40 bg-amber-950/40 px-3 py-2 text-xs text-amber-200">
-					Provisioning replaces any local SMB users — the domain's directory becomes the source of authentication for shares on this box.
-				</div>
-				<div class="mb-3">
-					<label for="dc-realm" class="text-sm text-muted-foreground">Realm {#if !dc.realm && dcProvisionTried}<span class="text-xs font-normal text-amber-500">required</span>{/if}</label>
-					<input
-						id="dc-realm"
-						type="text"
-						bind:value={dc.realm}
-						placeholder="ad.example.lan"
-						class="mt-1 w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring {requiredFieldCls(!dc.realm, dcProvisionTried)}"
-					/>
-				</div>
-				<div class="mb-3">
-					<label for="dc-admin-password" class="text-sm text-muted-foreground">Administrator password {#if !dc.adminPassword && dcProvisionTried}<span class="text-xs font-normal text-amber-500">required</span>{/if}</label>
-					<input
-						id="dc-admin-password"
-						type="password"
-						bind:value={dc.adminPassword}
-						class="mt-1 w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring {requiredFieldCls(!dc.adminPassword, dcProvisionTried)}"
-					/>
-				</div>
-				<div class="mb-3">
-					<label for="dc-dns-forwarder" class="text-sm text-muted-foreground">DNS forwarder</label>
-					<input
-						id="dc-dns-forwarder"
-						type="text"
-						bind:value={dc.dnsForwarder}
-						placeholder="auto — current upstream"
-						class="mt-1 w-full rounded-md border border-input bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-					/>
-				</div>
-				<Button size="sm" onclick={dcProvisionGuarded} disabled={dc.provisioning}>
-					{dc.provisioning ? 'Provisioning… (this can take a minute)' : 'Host domain'}
-				</Button>
-				</div>
-				</div>
-			{/if}
-		</section>
-	</div>
 
 {:else if activeTab === 'network'}
 

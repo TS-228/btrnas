@@ -25,18 +25,16 @@ and restores a whole snapshot into a staging destination on managed storage.
 The Admin-only **NASty System Recovery** preset includes:
 
 - `/var/lib/nasty` — engine settings and service definitions;
-- `/etc/nixos` — the installed system wrapper and hardware configuration;
+- `/etc/nasty` — installed system configuration overlays;
 - `/var/lib/caddy` — TLS certificates and the local CA identity;
 - `/var/lib/systemd/credential.secret` — the host key needed to decrypt
-  host-only `systemd-creds` values;
-- `/var/lib/sbctl` when Secure Boot signing keys exist.
+  host-only `systemd-creds` values.
 
 These sources contain appliance authentication state, filesystem recovery
-keys, TLS private keys, the host credential key, and potentially Secure Boot
-signing keys. Anyone with the repository password can recover this material.
-The password must be strong, unique, and stored separately. TPM-sealed
-credentials can still require the original TPM even when the host credential
-key is present.
+keys, TLS private keys, and the host credential key. Anyone with the
+repository password can recover this material. The password must be strong,
+unique, and stored separately. TPM-sealed credentials can still require the
+original TPM even when the host credential key is present.
 
 The preset deliberately excludes live Samba/AD databases. A file-level copy
 of live TDB/LDB state can be inconsistent; hosted domains must use the

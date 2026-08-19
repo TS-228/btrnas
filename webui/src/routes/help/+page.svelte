@@ -16,12 +16,12 @@
 				{
 					term: 'Subvolume',
 					summary: 'An isolated directory or block device within a filesystem.',
-					detail: 'Subvolumes are lightweight divisions of a filesystem. Each subvolume can have its own quota, compression, and tiering settings. There are two types: "filesystem" subvolumes (used for NFS/SMB file shares) and "block" subvolumes (used for iSCSI/NVMe-oF block storage). Think of them like folders with superpowers — they can be snapshotted, quota-limited, and independently managed.',
+					detail: 'Subvolumes are lightweight divisions of a filesystem. Each subvolume can have its own quota, compression, and tiering settings. There are two types: "filesystem" subvolumes (used for NFS, SMB, FTP, SFTP, and S3 shares) and "block" subvolumes (used for iSCSI/NVMe-oF block storage). Think of them like folders with superpowers — they can be snapshotted, quota-limited, and independently managed.',
 				},
 				{
 					term: 'Share',
 					summary: 'A subvolume exported over the network so other machines can access it.',
-					detail: 'A share makes a subvolume available to other computers on your network using a protocol like NFS or SMB. Without a share, data in a subvolume is only accessible locally on the NAS.',
+					detail: 'A share makes a subvolume available to other computers on your network using a protocol like NFS, SMB, FTP, SFTP, or S3. Without a share, data in a subvolume is only accessible locally on the NAS.',
 				},
 				{
 					term: 'Snapshot',
@@ -42,6 +42,21 @@
 					term: 'SMB',
 					summary: 'Server Message Block — the standard for Windows file sharing.',
 					detail: 'Use SMB when your clients are Windows PCs or you need broad compatibility. Also works with macOS and Linux. Supports user authentication. Best for: Windows networks, mixed OS environments, desktop file access.',
+				},
+				{
+					term: 'FTP',
+					summary: 'File Transfer Protocol — a simple file server for cameras, scanners, and legacy clients.',
+					detail: 'Served by rclone. Shares appear as top-level folders under one listener (default port 21, plus a passive port range). Authentication is a single username/password for the whole protocol, not per share. FTP is unencrypted — prefer SFTP on untrusted networks. Enable it under Sharing or Services, then create shares like SMB.',
+				},
+				{
+					term: 'SFTP',
+					summary: 'SSH File Transfer — encrypted file access over SSH, without opening the box SSH daemon.',
+					detail: 'Served by rclone on port 2022 by default so it does not collide with SSH on port 22. Shares appear as top-level folders. Like FTP, credentials are per-protocol (one user). Best for: encrypted uploads from scripts, NAS clients, and tools that speak SFTP but not SMB.',
+				},
+				{
+					term: 'S3',
+					summary: 'S3-compatible object API — apps talk to shares as buckets.',
+					detail: 'Served by rclone on port 9000 by default. Each share name is a path-style bucket. Access key and secret key are protocol-level (one pair for every bucket). Best for: backup tools, object-storage clients, and apps that expect an S3 endpoint rather than a file share.',
 				},
 				{
 					term: 'iSCSI',
@@ -79,11 +94,6 @@
 					detail: 'Each iSCSI target accepts connections through one or more portals (IP:port pairs). NASty lets you manage portals per target — bind a target to a specific interface or a custom port — and the firewall follows the configured portals automatically, so a portal on a non-default port is reachable without manual rules.',
 				},
 				{
-					term: 'Time Machine',
-					summary: 'Turn an SMB share into a macOS Time Machine backup destination.',
-					detail: 'Tick "Time Machine" when creating an SMB share to make it a backup target for macOS. NASty applies the Samba vfs_fruit options Time Machine needs and advertises the share over mDNS (_adisk) so it auto-appears in System Settings → Time Machine → Add Backup Disk — no manual mounting. A Time Machine share must be authenticated and writable (not guest, not read-only), so add the one user who will back up. Optionally cap its size, and point it at a quota\'d subvolume as a hard backstop. The share is pinned so Time Machine — not Docker/Samba — thins old backups.',
-				},
-				{
 					term: 'Guest Share',
 					summary: 'A public link to a file or folder for someone who has no NASty account.',
 					detail: 'Create one from the Files page (the Share action) to hand a file or whole folder to an outside recipient. The link itself is the credential — only its hash is stored, so it\'s shown once at creation and can\'t be retrieved afterwards. Optional controls: an expiry, a password, and a download limit. Folders download as a streamed ZIP. Recipients land on a no-login page; downloads are always served as attachments (never rendered inline) so shared content can\'t run on the app origin, and any unavailable link (expired, revoked, over its limit) returns the same generic message. Manage and revoke links under Sharing → Guest Shares.',
@@ -96,7 +106,7 @@
 				{
 					term: 'Quota',
 					summary: 'A size limit on a subvolume.',
-					detail: 'Quotas prevent a subvolume from consuming more than its allocated space. For block subvolumes (iSCSI/NVMe-oF), the quota defines the size of the virtual disk. For filesystem subvolumes (NFS/SMB), it\'s optional — without one, the subvolume can use all available space.',
+					detail: 'Quotas prevent a subvolume from consuming more than its allocated space. For block subvolumes (iSCSI/NVMe-oF), the quota defines the size of the virtual disk. For filesystem subvolumes (NFS, SMB, FTP, SFTP, S3), it\'s optional — without one, the subvolume can use all available space.',
 				},
 				{
 					term: 'Replication',
@@ -331,62 +341,7 @@
 				{
 					term: 'PCR (Platform Configuration Register)',
 					summary: 'TPM-internal registers that record what booted, in a way that can\'t be rewound or faked.',
-					detail: 'PCRs are 24 (or 32) hash values inside the TPM that accumulate measurements during boot. Every component — firmware, bootloader, kernel, initrd, key databases — gets hashed and "extended" into one of these registers. Once a value is extended you can\'t set it back; the only way for a PCR to read a given value is for the boot chain to produce that exact value organically. NASty seals encryption keys against specific PCRs: PCR-7 covers the Secure Boot policy (which keys the firmware trusts), so the seal opens only when the firmware is still trusting NASty\'s keys. Future work extends to PCR-4 (the bootloader + kernel binaries themselves) so the seal binds the whole boot chain, not just the policy.',
-				},
-				{
-					term: 'Secure Boot',
-					summary: 'Firmware-level signature checking on the bootloader, kernel, and initrd.',
-					detail: 'When Secure Boot is on, the UEFI firmware refuses to launch any boot artifact that isn\'t signed by a key in its trust database. NASty\'s SB integration uses lanzaboote to bundle the kernel + initrd + cmdline into a signed PE stub the firmware verifies before handing off control. Enrollment is a one-time per-box ceremony (BIOS Setup Mode → NASty\'s platform key gets installed → next reboot enforces). Once enrolled, every kernel and initrd update is auto-signed on rebuild; an attacker booting an unsigned rescue image (memtest, live USB) fails at the firmware stage. SB also strengthens TPM2 sealing — without it PCR-7 is constant across stock NixOS installs, so a sealed key would unseal anywhere. Highly experimental in NASty today; see the Hardware page.',
-				},
-				{
-					term: 'Setup Mode',
-					summary: 'A UEFI firmware state where it accepts new platform keys without an existing signing chain.',
-					detail: 'A fresh-from-factory or "PK-cleared" UEFI is in Setup Mode: PK (Platform Key) is empty, and the firmware will accept any key enrolled by the operating system without a higher-trust signature. Once a PK is enrolled the firmware leaves Setup Mode and starts enforcing the full SB chain. NASty\'s enrollment ceremony requires the operator to reset firmware to Setup Mode (via BIOS — vendor-specific path documented in the wizard) so that on the next boot, systemd-boot\'s auto-enrollment can install NASty\'s keys without needing a Microsoft-signed bridge. After enrollment, firmware exits Setup Mode automatically.',
-				},
-				{
-					term: 'Measured UKI',
-					summary: 'A Unified Kernel Image whose load is recorded into a PCR.',
-					detail: 'A UKI bundles the kernel, initrd, and command line into a single PE binary. When the firmware loads it and Secure Boot is on, the firmware records the binary\'s hash into PCR-4 — so a different kernel produces a different PCR-4 reading. lanzaboote produces measured UKIs on every NixOS rebuild; bootctl status reports "Measured UKI: yes" when this is active. This is what lets future work seal keys against PCR-4 to bind the entire boot chain (not just the SB policy in PCR-7).',
-				},
-				{
-					term: 'lanzaboote',
-					summary: 'The NixOS-native Secure Boot toolchain.',
-					detail: 'lanzaboote (https://github.com/nix-community/lanzaboote) replaces systemd-boot\'s normal install with a flow that signs every kernel + initrd + UKI for the firmware to verify. NASty pins lanzaboote v1.0.0 as a flake input and ships sbctl alongside as the read-only inspector. Pin and key management live entirely inside the NASty install — operators don\'t pick a lanzaboote rev (the protocol with sd-stub and the install-hook contract are nasty-test-matrix dependent). See the experimental Secure Boot enrollment wizard on the Hardware page.',
-				},
-				{
-					term: 'sbctl',
-					summary: 'CLI tool for inspecting Secure Boot state — keys, signatures, enrollment status.',
-					detail: 'NASty includes sbctl on the system path so operators can inspect SB state by hand (`sbctl status`, `sbctl verify`, `sbctl list-enrolled-keys`). The engine itself uses it as a read-only inspector — signing and key enrollment go through lanzaboote, never direct sbctl writes. Run it from a terminal if you want raw vendor / key-fingerprint data the WebUI doesn\'t surface.',
-				},
-			],
-		},
-		{
-			title: 'Directory (Active Directory)',
-			entries: [
-				{
-					term: 'Active Directory (AD)',
-					summary: 'Centralized logins and groups for a whole network — one place where users, passwords, and machines live.',
-					detail: 'Instead of managing accounts on every box, machines join a domain and authenticate users against it. NASty speaks both sides: it can join an existing domain as a member (Settings → Directory → join), or host a domain itself as the domain controller — replacing a Windows Server or Synology Directory Server. Domain users and groups can then be used in share permissions. AD support is currently experimental — validated continuously in CI, still gathering real-world mileage.',
-				},
-				{
-					term: 'Domain Controller (DC)',
-					summary: 'The server that hosts an Active Directory domain — its user database, Kerberos, and DNS.',
-					detail: 'Host a new domain from Settings → Directory: pick a realm and an Administrator password, and this NASty becomes the DC with integrated DNS and Kerberos. Your shares keep working, served by the same box, and you manage domain users, groups, and joined computers from the WebUI. One DC per domain in this version — back the domain up from the same panel (the backup rides your normal backup profiles), and point your clients\' DNS at the NASty DC. Windows RSAT works against it for advanced administration (OUs, GPOs, policies). The DC role is experimental — treat domain backups as mandatory, not optional.',
-				},
-				{
-					term: 'Domain Join (Member Mode)',
-					summary: 'Attach NASty to an existing domain, so domain users can access its shares.',
-					detail: 'Joining makes NASty a member server: it authenticates SMB users against the domain\'s DC instead of local accounts, and domain users/groups become usable in share ACLs. You need domain-admin credentials once, for the join itself — they\'re used over a secure channel and never stored. A box is either a member or a DC, never both.',
-				},
-				{
-					term: 'Kerberos',
-					summary: 'The authentication protocol behind Active Directory — password-less tickets instead of sending passwords around.',
-					detail: 'Clients prove who they are to the domain once and receive time-limited tickets they present to services. Because tickets are time-stamped, clock skew between machines breaks logins — keep NTP working on everything in the domain. NASty configures Kerberos automatically on join or provision; you never edit krb5.conf by hand.',
-				},
-				{
-					term: 'Realm',
-					summary: 'The domain\'s name, written like DNS — e.g. ad.example.lan.',
-					detail: 'The realm is the identity of the whole domain: it names the Kerberos realm (uppercase, AD.EXAMPLE.LAN) and the DNS zone the domain controller serves. Pick something under a domain you control (or a .lan/.internal name) — it can\'t be changed later without rebuilding the domain.',
+					detail: 'PCRs are 24 (or 32) hash values inside the TPM that accumulate measurements during boot. Every component — firmware, bootloader, kernel, initrd — gets hashed and "extended" into one of these registers. Once a value is extended you can\'t set it back; the only way for a PCR to read a given value is for the boot chain to produce that exact value organically. NASty can seal encryption keys against selected PCRs so auto-unlock only succeeds when the measured boot state matches.',
 				},
 			],
 		},
@@ -434,12 +389,16 @@
 					summary: 'Use NFS or SMB — either works, NFS has less overhead.',
 				},
 				{
-					term: 'I want centralized logins for my machines',
-					summary: 'Use Active Directory — join an existing domain, or make NASty the domain controller (Settings → Directory).',
+					term: 'I want a camera, scanner, or legacy FTP client to upload files',
+					summary: 'Use FTP. Prefer SFTP if the client supports it — FTP is unencrypted.',
 				},
 				{
-					term: 'I want to back up my Mac with Time Machine',
-					summary: 'Create an SMB share with Time Machine enabled.',
+					term: 'I want encrypted file transfer without SMB',
+					summary: 'Use SFTP (port 2022 by default).',
+				},
+				{
+					term: 'I want an S3-compatible endpoint for apps or backup tools',
+					summary: 'Use S3. Share names become bucket names (path-style).',
 				},
 				{
 					term: 'I want to give a file to someone without a NASty account',

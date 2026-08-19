@@ -8,7 +8,7 @@
 	import { confirm } from '$lib/confirm.svelte';
 	import { requiredFieldCls } from '$lib/utils';
 	import { readSubvolumeCompressionPolicy, readSubvolumeStoragePolicy, storagePolicyUpdate, type ErasureCodeSetting } from '$lib/subvolume-storage-policy';
-	import type { Filesystem, Subvolume, SubvolumeDependents, Snapshot, SubvolumeType, NfsShare, SmbShare, IscsiTarget, NvmeofSubsystem, App, AppsStatus, VmStatus } from '$lib/types';
+	import type { Filesystem, Subvolume, SubvolumeDependents, Snapshot, SubvolumeType, NfsShare, SmbShare, RcloneShare, IscsiTarget, NvmeofSubsystem, App, AppsStatus, VmStatus } from '$lib/types';
 	import { Button } from '$lib/components/ui/button';
 	import { Card, CardContent } from '$lib/components/ui/card';
 	import { Badge } from '$lib/components/ui/badge';
@@ -302,17 +302,23 @@
 	interface LinkedShares {
 		nfs: NfsShare[];
 		smb: SmbShare[];
+		ftp: RcloneShare[];
+		sftp: RcloneShare[];
+		s3: RcloneShare[];
 		iscsi: IscsiTarget[];
 		nvmeof: NvmeofSubsystem[];
 		apps: App[];
 		vms: VmStatus[];
 	}
-	let detailShares = $state<LinkedShares>({ nfs: [], smb: [], iscsi: [], nvmeof: [], apps: [], vms: [] });
+	let detailShares = $state<LinkedShares>({ nfs: [], smb: [], ftp: [], sftp: [], s3: [], iscsi: [], nvmeof: [], apps: [], vms: [] });
 	// All consumers loaded once at page level so the overview usage column
 	// and each detail panel can index them without re-fetching.  Shares,
 	// VMs and the apps roster + apps.storage_path all live here.
 	let allNfs: NfsShare[] = $state([]);
 	let allSmb: SmbShare[] = $state([]);
+	let allFtp: RcloneShare[] = $state([]);
+	let allSftp: RcloneShare[] = $state([]);
+	let allS3: RcloneShare[] = $state([]);
 	let allIscsi: IscsiTarget[] = $state([]);
 	let allNvmeof: NvmeofSubsystem[] = $state([]);
 	let allVms: VmStatus[] = $state([]);
@@ -330,9 +336,12 @@
 
 	async function loadShares() {
 		const generation = ++sharesLoadGeneration;
-		const [nfs, smb, iscsi, nvmeof, vms, appsList, appsStat, deps] = await Promise.allSettled([
+		const [nfs, smb, ftpShares, sftpShares, s3Shares, iscsi, nvmeof, vms, appsList, appsStat, deps] = await Promise.allSettled([
 			client.call<NfsShare[]>('share.nfs.list'),
 			client.call<SmbShare[]>('share.smb.list'),
+			client.call<RcloneShare[]>('share.ftp.list'),
+			client.call<RcloneShare[]>('share.sftp.list'),
+			client.call<RcloneShare[]>('share.s3.list'),
 			client.call<IscsiTarget[]>('share.iscsi.list'),
 			client.call<NvmeofSubsystem[]>('share.nvmeof.list'),
 			client.call<VmStatus[]>('vm.list'),
@@ -343,6 +352,9 @@
 		if (generation !== sharesLoadGeneration) return;
 		allNfs = nfs.status === 'fulfilled' ? nfs.value : [];
 		allSmb = smb.status === 'fulfilled' ? smb.value : [];
+		allFtp = ftpShares.status === 'fulfilled' ? ftpShares.value : [];
+		allSftp = sftpShares.status === 'fulfilled' ? sftpShares.value : [];
+		allS3 = s3Shares.status === 'fulfilled' ? s3Shares.value : [];
 		allIscsi = iscsi.status === 'fulfilled' ? iscsi.value : [];
 		allNvmeof = nvmeof.status === 'fulfilled' ? nvmeof.value : [];
 		allVms = vms.status === 'fulfilled' ? vms.value : [];
@@ -390,6 +402,7 @@
 
 	const detailShareCount = $derived(
 		detailShares.nfs.length + detailShares.smb.length +
+		detailShares.ftp.length + detailShares.sftp.length + detailShares.s3.length +
 		detailShares.iscsi.length + detailShares.nvmeof.length +
 		detailShares.apps.length + detailShares.vms.length
 	);
@@ -410,7 +423,7 @@
 		detailTab = 'info';
 		detailSnapshots = [];
 		nestedSubvolumes = [];
-		detailShares = { nfs: [], smb: [], iscsi: [], nvmeof: [], apps: [], vms: [] };
+		detailShares = { nfs: [], smb: [], ftp: [], sftp: [], s3: [], iscsi: [], nvmeof: [], apps: [], vms: [] };
 
 		// Snapshots and children are per-FS API calls; share lists are
 		// page-level state (loadShares) so we just index them here.
@@ -429,6 +442,9 @@
 		detailShares = {
 			nfs: allNfs.filter(s => s.path === svPath),
 			smb: allSmb.filter(s => s.path === svPath),
+			ftp: allFtp.filter(s => s.path === svPath),
+			sftp: allSftp.filter(s => s.path === svPath),
+			s3: allS3.filter(s => s.path === svPath),
 			iscsi: allIscsi.filter(t =>
 				blockDev != null && t.luns.some(l => l.backstore_path === blockDev)),
 			nvmeof: allNvmeof.filter(sub =>
@@ -564,7 +580,7 @@
 	 * the entity ID to pass it. NFS/SMB/iSCSI/NVMe-oF are pure config
 	 * removals — no data loss outside the subvolume itself, which is
 	 * about to go anyway. */
-	type CascadableDep = { kind: 'nfs' | 'smb' | 'iscsi' | 'nvmeof'; label: string; id: string };
+	type CascadableDep = { kind: 'nfs' | 'smb' | 'ftp' | 'sftp' | 's3' | 'iscsi' | 'nvmeof'; label: string; id: string };
 
 	const cascadableDeps = $derived.by((): CascadableDep[] => {
 		if (!deleteDeps) return [];
@@ -579,6 +595,18 @@
 		for (const name of deleteDeps.smb_shares) {
 			const s = allSmb.find(x => x.name === name);
 			if (s) out.push({ kind: 'smb', label: `SMB share '${name}'`, id: s.id });
+		}
+		for (const name of deleteDeps.ftp_shares) {
+			const s = allFtp.find(x => x.name === name);
+			if (s) out.push({ kind: 'ftp', label: `FTP share '${name}'`, id: s.id });
+		}
+		for (const name of deleteDeps.sftp_shares) {
+			const s = allSftp.find(x => x.name === name);
+			if (s) out.push({ kind: 'sftp', label: `SFTP share '${name}'`, id: s.id });
+		}
+		for (const name of deleteDeps.s3_shares) {
+			const s = allS3.find(x => x.name === name);
+			if (s) out.push({ kind: 's3', label: `S3 share '${name}'`, id: s.id });
 		}
 		for (const iqn of deleteDeps.iscsi_targets) {
 			const t = allIscsi.find(x => x.iqn === iqn);
@@ -791,6 +819,9 @@
 		system: string | null;     // SYSTEM_SUBVOLUMES description, or null
 		nfs: number;
 		smb: number;
+		ftp: number;
+		sftp: number;
+		s3: number;
 		iscsi: number;
 		nvmeof: number;
 		apps: number;
@@ -809,6 +840,9 @@
 				system: SYSTEM_SUBVOLUMES[sv.name] ?? null,
 				nfs: d?.nfs_shares.length ?? 0,
 				smb: d?.smb_shares.length ?? 0,
+				ftp: d?.ftp_shares.length ?? 0,
+				sftp: d?.sftp_shares.length ?? 0,
+				s3: d?.s3_shares.length ?? 0,
 				iscsi: d?.iscsi_targets.length ?? 0,
 				nvmeof: d?.nvmeof_subsystems.length ?? 0,
 				apps: d?.apps.length ?? 0,
@@ -1027,7 +1061,7 @@
 			<div class="mb-4">
 				<Label for="sv-type">Type</Label>
 				<select id="sv-type" bind:value={newType} class="mt-1 h-9 w-full rounded-md border border-input bg-transparent px-3 text-sm">
-					<option value="filesystem">File Share (NFS, SMB)</option>
+					<option value="filesystem">File Share (NFS, SMB, FTP, SFTP, S3)</option>
 					<option value="block">Block Device (iSCSI, NVMe-oF)</option>
 				</select>
 			</div>
@@ -1299,6 +1333,15 @@
 								{#if usage.smb > 0}
 									<Badge class="bg-amber-950 text-amber-400 text-[0.6rem]" title="{usage.smb} SMB share{usage.smb === 1 ? '' : 's'}">SMB{usage.smb > 1 ? ` ×${usage.smb}` : ''}</Badge>
 								{/if}
+								{#if usage.ftp > 0}
+									<Badge class="bg-sky-950 text-sky-400 text-[0.6rem]" title="{usage.ftp} FTP share{usage.ftp === 1 ? '' : 's'}">FTP{usage.ftp > 1 ? ` ×${usage.ftp}` : ''}</Badge>
+								{/if}
+								{#if usage.sftp > 0}
+									<Badge class="bg-blue-950 text-blue-400 text-[0.6rem]" title="{usage.sftp} SFTP share{usage.sftp === 1 ? '' : 's'}">SFTP{usage.sftp > 1 ? ` ×${usage.sftp}` : ''}</Badge>
+								{/if}
+								{#if usage.s3 > 0}
+									<Badge class="bg-orange-950 text-orange-400 text-[0.6rem]" title="{usage.s3} S3 share{usage.s3 === 1 ? '' : 's'}">S3{usage.s3 > 1 ? ` ×${usage.s3}` : ''}</Badge>
+								{/if}
 								{#if usage.iscsi > 0}
 									<Badge class="bg-purple-950 text-purple-400 text-[0.6rem]" title="{usage.iscsi} iSCSI target{usage.iscsi === 1 ? '' : 's'}">iSCSI{usage.iscsi > 1 ? ` ×${usage.iscsi}` : ''}</Badge>
 								{/if}
@@ -1308,10 +1351,10 @@
 								{#if usage.backups > 0}
 									<Badge class="bg-teal-950 text-teal-400 text-[0.6rem]" title="{usage.backups} backup job{usage.backups === 1 ? '' : 's'} reading from this subvolume">Backups{usage.backups > 1 ? ` ×${usage.backups}` : ''}</Badge>
 								{/if}
-								{#if usage.system && usage.apps === 0 && usage.vms === 0 && usage.nfs === 0 && usage.smb === 0 && usage.iscsi === 0 && usage.nvmeof === 0 && usage.backups === 0}
+								{#if usage.system && usage.apps === 0 && usage.vms === 0 && usage.nfs === 0 && usage.smb === 0 && usage.ftp === 0 && usage.sftp === 0 && usage.s3 === 0 && usage.iscsi === 0 && usage.nvmeof === 0 && usage.backups === 0}
 									<Badge class="bg-slate-800 text-slate-300 text-[0.6rem]" title={usage.system}>System</Badge>
 								{/if}
-								{#if !usage.system && usage.apps === 0 && usage.vms === 0 && usage.nfs === 0 && usage.smb === 0 && usage.iscsi === 0 && usage.nvmeof === 0 && usage.backups === 0}
+								{#if !usage.system && usage.apps === 0 && usage.vms === 0 && usage.nfs === 0 && usage.smb === 0 && usage.ftp === 0 && usage.sftp === 0 && usage.s3 === 0 && usage.iscsi === 0 && usage.nvmeof === 0 && usage.backups === 0}
 									<span class="text-xs text-muted-foreground">—</span>
 								{/if}
 							</div>
@@ -1549,6 +1592,27 @@
 													<Badge class="bg-amber-950 text-amber-400 text-[0.6rem]">SMB</Badge>
 													<span class="text-sm">{share.name}</span>
 													<span class="text-xs text-muted-foreground">{share.guest_ok ? 'guest' : share.valid_users.join(', ') || 'auth'}</span>
+												</div>
+											{/each}
+											{#each detailShares.ftp as share}
+												<div class="flex items-center gap-2 rounded-md border border-border px-3 py-2">
+													<Badge class="bg-sky-950 text-sky-400 text-[0.6rem]">FTP</Badge>
+													<span class="text-sm">{share.name}</span>
+													<span class="text-xs text-muted-foreground">{share.read_only ? 'RO' : 'RW'}</span>
+												</div>
+											{/each}
+											{#each detailShares.sftp as share}
+												<div class="flex items-center gap-2 rounded-md border border-border px-3 py-2">
+													<Badge class="bg-blue-950 text-blue-400 text-[0.6rem]">SFTP</Badge>
+													<span class="text-sm">{share.name}</span>
+													<span class="text-xs text-muted-foreground">{share.read_only ? 'RO' : 'RW'}</span>
+												</div>
+											{/each}
+											{#each detailShares.s3 as share}
+												<div class="flex items-center gap-2 rounded-md border border-border px-3 py-2">
+													<Badge class="bg-orange-950 text-orange-400 text-[0.6rem]">S3</Badge>
+													<span class="text-sm">{share.name}</span>
+													<span class="text-xs text-muted-foreground">{share.read_only ? 'RO' : 'RW'}</span>
 												</div>
 											{/each}
 											{#each detailShares.iscsi as target}

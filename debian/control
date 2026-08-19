@@ -1,0 +1,78 @@
+Source: nasty
+Section: admin
+Priority: optional
+Maintainer: Stephan <stephan@localhost>
+Build-Depends:
+ debhelper-compat (= 13),
+ cargo,
+ rustc,
+ pkg-config,
+ libssl-dev,
+ clang,
+ libsqlite3-dev,
+ nodejs (>= 20),
+ npm,
+ ca-certificates,
+ git
+Standards-Version: 4.7.0
+Homepage: https://github.com/nasty-project/nasty
+Rules-Requires-Root: no
+
+Package: nasty-engine
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends},
+ systemd,
+ network-manager,
+ nftables,
+ btrfs-progs,
+ snapper,
+ ksmbd-tools,
+ wsdd2,
+ rclone,
+ util-linux,
+ gdisk,
+ mdadm,
+ lvm2,
+ iproute2,
+ smartmontools,
+ pciutils,
+ usbutils,
+ curl,
+ rsync,
+ procps
+Recommends:
+ docker.io | docker-ce,
+ docker-compose | docker-compose-v2,
+ qemu-system-arm | qemu-system,
+ nfs-kernel-server,
+ targetcli-fb,
+ nvme-cli,
+ caddy,
+ fwupd,
+ dmidecode
+Description: NASty engine and metrics collector (Debian)
+ JSON-RPC engine and Prometheus metrics collector for the NASty NAS
+ appliance. Built for Debian Trixie on armhf (QNAP TS-228 / RTD1195)
+ and other architectures.
+ .
+ SMB file sharing uses ksmbd; FTP, SFTP, and S3 use rclone serve.
+ System upgrades use apt with snapper btrfs snapshots for rollback.
+
+Package: nasty-webui
+Architecture: all
+Depends: ${misc:Depends}
+Description: NASty web user interface (static assets)
+ SvelteKit static build served by the engine / reverse proxy.
+
+Package: nasty
+Architecture: all
+Depends: ${misc:Depends},
+ nasty-engine (>= ${source:Version}),
+ nasty-webui (>= ${source:Version}),
+ snapper,
+ btrfs-progs,
+ apt
+Recommends: caddy, network-manager
+Description: NASty NAS appliance metapackage (Debian Trixie)
+ Pulls in the engine, web UI, and tools needed for apt-based upgrades
+ with snapper btrfs snapshots before package changes.

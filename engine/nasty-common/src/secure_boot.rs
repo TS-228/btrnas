@@ -1,12 +1,8 @@
 //! Secure Boot state readout — what does UEFI see right now?
 //!
-//! Source: `bootctl status`. systemd-bootctl is on every NixOS box
-//! already (no extra dep), reports SB state, setup-mode flag, and the
+//! Source: `bootctl status`. Reports SB state, setup-mode flag, and the
 //! "(unsupported)" parenthetical that distinguishes "firmware can't
-//! enable SB" from "firmware can but operator hasn't" — three states
-//! that efivars only expose across multiple variables and that sbctl
-//! collapses into one unhelpful "disabled". As a bonus we get the
-//! Measured UKI flag, which lanzaboote integration will want later.
+//! enable SB" from "firmware can but operator hasn't".
 //!
 //! Parsing: plaintext, line-by-line, scanning the `System:` block.
 //! Format has been stable since systemd 250-ish; both the label
@@ -44,13 +40,9 @@ pub struct SecureBootStatus {
     pub unsupported: Option<bool>,
     /// `Some(true)` when bootctl reports `Measured UKI: yes` — kernel
     /// and initrd are loaded as a measured Unified Kernel Image.
-    /// Useful signal for the future lanzaboote integration where SB
-    /// and measured boot together strengthen the PCR-7 seal.
     pub measured_uki: Option<bool>,
     /// Free-form one-line reason when we couldn't determine the
-    /// state ("bootctl unavailable: …", "bootctl status returned no
-    /// System: block", etc.). Surfaced under the Hardware card's
-    /// status pill.
+    /// state ("bootctl unavailable: …", etc.).
     pub note: Option<String>,
 }
 

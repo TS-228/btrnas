@@ -1225,9 +1225,39 @@ fn validate_create_request(req: &CreateFilesystemRequest) -> Result<(), Filesyst
     if let Some(comp) = &req.compression {
         validate_compression(comp).map_err(FilesystemError::InvalidInput)?;
     }
-    if req.encryption == Some(true) && req.passphrase.as_deref().is_none_or(str::is_empty) {
+    // btrfs first-cut: native encryption / TPM / EC / bcachefs-style
+    // tiering targets are not supported.
+    if req.encryption == Some(true) {
         return Err(FilesystemError::InvalidInput(
-            "passphrase is required when encryption=true".into(),
+            "encryption is not supported on btrfs builds".into(),
+        ));
+    }
+    if req.bind_to_tpm == Some(true) {
+        return Err(FilesystemError::InvalidInput(
+            "TPM key binding is not supported on btrfs builds".into(),
+        ));
+    }
+    if req.erasure_code == Some(true) {
+        return Err(FilesystemError::InvalidInput(
+            "erasure coding is not supported on btrfs builds".into(),
+        ));
+    }
+    if req.foreground_target.is_some()
+        || req.metadata_target.is_some()
+        || req.background_target.is_some()
+        || req.promote_target.is_some()
+    {
+        return Err(FilesystemError::InvalidInput(
+            "tiering targets are not supported on btrfs builds".into(),
+        ));
+    }
+    if req.data_checksum.is_some()
+        || req.metadata_checksum.is_some()
+        || req.bucket_size.is_some()
+        || req.encoded_extent_max.is_some()
+    {
+        return Err(FilesystemError::InvalidInput(
+            "bcachefs-specific format options are not supported on btrfs builds".into(),
         ));
     }
     if req.replicas == 0 {
@@ -1235,120 +1265,29 @@ fn validate_create_request(req: &CreateFilesystemRequest) -> Result<(), Filesyst
             "replicas must be at least 1".into(),
         ));
     }
+    if req.replicas > 2 {
+        return Err(FilesystemError::InvalidInput(
+            "btrfs first-cut supports replicas=1 (single) or replicas=2 (raid1) only".into(),
+        ));
+    }
+    if req.replicas == 2 && req.devices.len() < 2 {
+        return Err(FilesystemError::InvalidInput(
+            "replicas=2 requires at least 2 devices for btrfs raid1".into(),
+        ));
+    }
 
-    let mut total_durability = 0u32;
     for dev in &req.devices {
         if dev.path.is_empty() {
             return Err(FilesystemError::InvalidInput(
                 "device path must not be empty".into(),
             ));
         }
-        let durability = dev.durability.unwrap_or(1);
-        if durability > 2 {
-            return Err(FilesystemError::InvalidInput(format!(
-                "device {} has invalid durability {durability}; expected 0, 1, or 2",
-                dev.path
-            )));
-        }
-        total_durability = total_durability.saturating_add(durability);
         if let Some(label) = &dev.label {
             validate_create_label("device label", label)?;
         }
     }
-    if req.replicas > total_durability {
-        return Err(FilesystemError::InvalidInput(format!(
-            "{} replicas require at least that much total device durability (got {total_durability})",
-            req.replicas
-        )));
-    }
-    if req.erasure_code == Some(true) {
-        if req.replicas < 2 {
-            return Err(FilesystemError::InvalidInput(
-                "erasure coding requires replicas >= 2".into(),
-            ));
-        }
-        if req.devices.len() < (req.replicas as usize) + 1 {
-            return Err(FilesystemError::InvalidInput(format!(
-                "erasure coding with {} replicas requires at least {} devices (got {})",
-                req.replicas,
-                req.replicas + 1,
-                req.devices.len()
-            )));
-        }
-    }
-
-    for (field, value) in [
-        ("filesystem label", req.label.as_deref()),
-        ("foreground target", req.foreground_target.as_deref()),
-        ("metadata target", req.metadata_target.as_deref()),
-        ("background target", req.background_target.as_deref()),
-        ("promote target", req.promote_target.as_deref()),
-    ] {
-        if let Some(value) = value {
-            validate_create_label(field, value)?;
-        }
-    }
-    let targets: Vec<&str> = [
-        req.foreground_target.as_deref(),
-        req.metadata_target.as_deref(),
-        req.background_target.as_deref(),
-        req.promote_target.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    if !targets.is_empty() {
-        let default_label = req.label.as_deref().unwrap_or(&req.name);
-        let labels: Vec<&str> = req
-            .devices
-            .iter()
-            .map(|device| device.label.as_deref().unwrap_or(default_label))
-            .collect();
-        for target in targets {
-            let target_prefix = format!("{target}.");
-            if !labels
-                .iter()
-                .any(|label| *label == target || label.starts_with(&target_prefix))
-            {
-                return Err(FilesystemError::InvalidInput(format!(
-                    "tiering target '{target}' does not match any selected device label"
-                )));
-            }
-        }
-    }
-    for (field, value) in [
-        ("data_checksum", req.data_checksum.as_deref()),
-        ("metadata_checksum", req.metadata_checksum.as_deref()),
-    ] {
-        if let Some(value) = value
-            && !matches!(value, "none" | "crc32c" | "crc64" | "xxhash")
-        {
-            return Err(FilesystemError::InvalidInput(format!(
-                "invalid {field} value '{value}'"
-            )));
-        }
-    }
-    for (field, value) in [
-        ("bucket_size", req.bucket_size.as_deref()),
-        ("encoded_extent_max", req.encoded_extent_max.as_deref()),
-    ] {
-        if let Some(value) = value {
-            let bytes = parse_human_bytes(value).ok_or_else(|| {
-                FilesystemError::InvalidInput(format!("invalid {field} value '{value}'"))
-            })?;
-            if bytes == 0 || !bytes.is_power_of_two() {
-                return Err(FilesystemError::InvalidInput(format!(
-                    "{field} must be a non-zero power-of-two size"
-                )));
-            }
-        }
-    }
-    if let Some(value) = req.version_upgrade.as_deref()
-        && !matches!(value, "compatible" | "incompatible" | "none")
-    {
-        return Err(FilesystemError::InvalidInput(format!(
-            "invalid version_upgrade value '{value}'"
-        )));
+    if let Some(label) = req.label.as_deref() {
+        validate_create_label("filesystem label", label)?;
     }
     Ok(())
 }
@@ -1376,7 +1315,7 @@ fn node_usage_error(
         }
         if !candidate.holders.is_empty() {
             return Some(format!(
-                "{} is held by {}",
+                "{} is held by {} — reclaim via Disks → Wipe first",
                 candidate.path,
                 candidate.holders.join(", ")
             ));
@@ -1931,56 +1870,17 @@ async fn revalidate_create_targets(
 }
 
 fn build_create_format_args(req: &CreateFilesystemRequest, devices: &[DeviceSpec]) -> Vec<String> {
-    let mut args = vec!["format".to_string(), format!("--fs_label={}", req.name)];
-    if req.replicas > 1 {
-        args.push(format!("--replicas={}", req.replicas));
+    // mkfs.btrfs -L <label> [-d single|raid1] [-m single|raid1|dup] <devs…>
+    let mut args = vec!["-f".to_string(), "-L".to_string(), req.name.clone()];
+    if req.replicas >= 2 {
+        args.extend(["-d".into(), "raid1".into(), "-m".into(), "raid1".into()]);
+    } else if devices.len() == 1 {
+        // Single device: metadata dup is the usual default; be explicit.
+        args.extend(["-d".into(), "single".into(), "-m".into(), "dup".into()]);
+    } else {
+        args.extend(["-d".into(), "single".into(), "-m".into(), "raid1".into()]);
     }
-    if let Some(comp) = &req.compression {
-        args.push(format!("--compression={comp}"));
-    }
-    if req.encryption == Some(true) {
-        args.push("--encrypted".to_string());
-    }
-    for (name, target) in [
-        ("foreground_target", req.foreground_target.as_deref()),
-        ("metadata_target", req.metadata_target.as_deref()),
-        ("background_target", req.background_target.as_deref()),
-        ("promote_target", req.promote_target.as_deref()),
-    ] {
-        if let Some(target) = target {
-            args.push(format!("--{name}={target}"));
-        }
-    }
-    if req.erasure_code == Some(true) {
-        args.push("--erasure_code".to_string());
-    }
-    for (name, value) in [
-        ("data_checksum", req.data_checksum.as_deref()),
-        ("metadata_checksum", req.metadata_checksum.as_deref()),
-        ("bucket", req.bucket_size.as_deref()),
-        ("encoded_extent_max", req.encoded_extent_max.as_deref()),
-    ] {
-        if let Some(value) = value {
-            args.push(format!("--{name}={value}"));
-        }
-    }
-
-    let has_targets = req.foreground_target.is_some()
-        || req.metadata_target.is_some()
-        || req.background_target.is_some()
-        || req.promote_target.is_some();
     for dev in devices {
-        if let Some(label) = &dev.label {
-            args.push(format!("--label={label}"));
-        } else if has_targets {
-            args.push(format!(
-                "--label={}",
-                req.label.as_deref().unwrap_or(&req.name)
-            ));
-        }
-        if let Some(durability) = dev.durability {
-            args.push(format!("--durability={durability}"));
-        }
         args.push(dev.path.clone());
     }
     args
@@ -2249,7 +2149,7 @@ impl FilesystemService {
         failed_names
     }
 
-    /// List all bcachefs filesystems (mounted and known via blkid).
+    /// List all btrfs filesystems (mounted and known via blkid).
     /// Results are cached for up to 3 seconds to avoid redundant subprocess calls.
     pub async fn list(&self) -> Result<Vec<Filesystem>, FilesystemError> {
         {
@@ -2283,7 +2183,7 @@ impl FilesystemService {
 
     /// Uncached implementation of filesystem listing.
     async fn list_uncached(&self) -> Result<Vec<Filesystem>, FilesystemError> {
-        let mounts = read_bcachefs_mounts().await?;
+        let mounts = read_btrfs_mounts().await?;
         let state = load_fs_state().await;
 
         // A single bcachefs filesystem can have multiple mount points — e.g. kubelet
@@ -2347,11 +2247,11 @@ impl FilesystemService {
             });
         }
 
-        // Discover unmounted bcachefs filesystems via blkid
-        let unmounted = discover_unmounted_bcachefs(&seen_uuids).await;
+        // Discover unmounted btrfs filesystems via blkid
+        let unmounted = discover_unmounted_btrfs(&seen_uuids).await;
         for (uuid, _label, devices) in unmounted {
             // Infer filesystem name from existing mount directory or fs-state.json.
-            // Note: blkid's LABEL_SUB is the bcachefs per-device tiering label
+            // Note: blkid LABEL is the filesystem label when present
             // (e.g. "fast", "slow"), NOT the filesystem name — don't use it.
             let name = filesystem_name_for_uuid(&state, &uuid);
 
@@ -2488,7 +2388,7 @@ impl FilesystemService {
         select_filesystem_for_mount(self.list().await?, name, expected_uuid)
     }
 
-    /// Create a new bcachefs filesystem: format devices, create mount point, mount
+    /// Create a new btrfs filesystem: format devices, create mount point, mount
     pub async fn create(
         &self,
         req: CreateFilesystemRequest,
@@ -2509,7 +2409,7 @@ impl FilesystemService {
             }
         };
 
-        // This is the last operation before `bcachefs format`: every target
+        // This is the last operation before `mkfs.btrfs`: every target
         // must still be the exact device planned above and remain unused.
         if let Err(e) = revalidate_create_targets(&plan, &req.devices).await {
             let _ = tokio::fs::remove_dir(&mount_point).await;
@@ -2517,84 +2417,37 @@ impl FilesystemService {
         }
         let args = build_create_format_args(&req, &req.devices);
 
-        // Format
+        // Format with mkfs.btrfs
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let dev_paths: Vec<&str> = req.devices.iter().map(|d| d.path.as_str()).collect();
-        let is_encrypted = req.encryption == Some(true);
         info!(
-            "Formatting bcachefs filesystem '{}' on {:?}{}",
-            req.name,
-            dev_paths,
-            if is_encrypted { " (encrypted)" } else { "" }
+            "Formatting btrfs filesystem '{}' on {:?}",
+            req.name, dev_paths
         );
 
-        if is_encrypted {
-            let passphrase = req
-                .passphrase
-                .as_deref()
-                .expect("encrypted request was validated before execution");
-            // bcachefs format --encrypted reads passphrase twice from stdin (passphrase + confirm)
-            let stdin = format!("{passphrase}\n{passphrase}\n");
-            let output = match cmd::run_stdin("bcachefs", &arg_refs, stdin.as_bytes()).await {
-                Ok(output) => output,
-                Err(e) => {
-                    let _ = tokio::fs::remove_dir(&mount_point).await;
-                    return Err(FilesystemError::CommandFailed(format!(
-                        "failed to execute bcachefs: {e}"
-                    )));
-                }
-            };
+        let output = match cmd::run("mkfs.btrfs", &arg_refs).await {
+            Ok(output) => output,
+            Err(e) => {
+                let _ = tokio::fs::remove_dir(&mount_point).await;
+                return Err(FilesystemError::CommandFailed(format!(
+                    "failed to execute mkfs.btrfs: {e}"
+                )));
+            }
+        };
 
-            if !output.status.success() {
-                // bcachefs format writes superblocks then does a trial open that
-                // can race with udev, causing EBUSY on exit even though format
-                // succeeded.  Check if superblocks were actually written.
-                if !is_device_bcachefs(&req.devices[0].path).await {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    let _ = tokio::fs::remove_dir(&mount_point).await;
-                    return Err(FilesystemError::CommandFailed(format!(
-                        "bcachefs exited with {}: {stderr}",
-                        output.status
-                    )));
-                }
-                warn!(
-                    "bcachefs format exited with {} but superblocks are present, continuing",
+        if !output.status.success() {
+            if !is_device_btrfs(&req.devices[0].path).await {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let _ = tokio::fs::remove_dir(&mount_point).await;
+                return Err(FilesystemError::CommandFailed(format!(
+                    "mkfs.btrfs exited with {}: {stderr}",
                     output.status
-                );
+                )));
             }
-
-            // Store key for auto-unlock (default: yes)
-            if req.store_key != Some(false) {
-                tokio::fs::create_dir_all(KEYS_DIR).await?;
-                let key_path = format!("{KEYS_DIR}/{}.key", req.name);
-                tokio::fs::write(&key_path, passphrase.as_bytes()).await?;
-                info!("Encryption key stored at {key_path}");
-            }
-        } else {
-            let output = match cmd::run("bcachefs", &arg_refs).await {
-                Ok(output) => output,
-                Err(e) => {
-                    let _ = tokio::fs::remove_dir(&mount_point).await;
-                    return Err(FilesystemError::CommandFailed(format!(
-                        "failed to execute bcachefs: {e}"
-                    )));
-                }
-            };
-
-            if !output.status.success() {
-                if !is_device_bcachefs(&req.devices[0].path).await {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    let _ = tokio::fs::remove_dir(&mount_point).await;
-                    return Err(FilesystemError::CommandFailed(format!(
-                        "bcachefs exited with {}: {stderr}",
-                        output.status
-                    )));
-                }
-                warn!(
-                    "bcachefs format exited with {} but superblocks are present, continuing",
-                    output.status
-                );
-            }
+            warn!(
+                "mkfs.btrfs exited with {} but superblocks are present, continuing",
+                output.status
+            );
         }
 
         let uuid = get_fs_uuid(&req.devices[0].path)
@@ -2615,47 +2468,26 @@ impl FilesystemService {
         )
         .await?;
 
-        let device_arg = req
-            .devices
-            .iter()
-            .map(|d| d.path.as_str())
-            .collect::<Vec<_>>()
-            .join(":");
-
-        // Unlock encrypted filesystem before mounting
-        if is_encrypted {
-            if let Some(bytes) = read_unlock_key(&req.name).await? {
-                bcachefs_unlock_with_key(&req.devices[0].path, &bytes).await?;
-            } else if let Some(ref passphrase) = req.passphrase {
-                let stdin = format!("{passphrase}\n");
-                cmd::run_ok_stdin(
-                    "bcachefs",
-                    &["unlock", "-k", "session", &req.devices[0].path],
-                    stdin.as_bytes(),
-                )
-                .await
-                .map_err(FilesystemError::CommandFailed)?;
-            }
-        }
-
-        // Mount
-        let mount_opts = FsMountOptions {
-            encrypted: if is_encrypted { Some(true) } else { None },
-            version_upgrade: req.version_upgrade.clone(),
-            journal_flush_delay: req.journal_flush_delay,
+        // Mount via util-linux mount -t btrfs (UUID= is robust for multi-device).
+        let mut mount_opts = FsMountOptions {
+            compression: req.compression.clone(),
             ..FsMountOptions::default()
         };
         let mount_opt_str = build_mount_opts(&mount_opts);
+        let uuid_source = format!("UUID={uuid}");
         info!(
             "Mounting filesystem '{}' at {} with options: {}",
             req.name, mount_point, mount_opt_str
         );
-        cmd::run_ok(
-            "bcachefs",
-            &["mount", "-o", &mount_opt_str, &device_arg, &mount_point],
-        )
-        .await
-        .map_err(FilesystemError::CommandFailed)?;
+        let mut mount_args = vec!["-t", "btrfs"];
+        if !mount_opt_str.is_empty() {
+            mount_args.extend(["-o", mount_opt_str.as_str()]);
+        }
+        mount_args.extend([uuid_source.as_str(), mount_point.as_str()]);
+        if let Err(e) = cmd::run_ok("mount", &mount_args).await {
+            let _ = tokio::fs::remove_dir(&mount_point).await;
+            return Err(FilesystemError::CommandFailed(e));
+        }
 
         let mounted_uuid = mounted_fs_uuid_after_mount(&mount_point).await;
         if mounted_uuid.as_deref() != Some(uuid.as_str()) {
@@ -2670,10 +2502,9 @@ impl FilesystemService {
         }
 
         // Track mount state with identity info for boot reconciliation
-        let mut saved_opts = mount_opts;
-        saved_opts.uuid = Some(uuid.clone());
-        saved_opts.devices = req.devices.iter().map(|d| d.path.clone()).collect();
-        save_fs_mounted_with_opts(&req.name, saved_opts).await;
+        mount_opts.uuid = Some(uuid.clone());
+        mount_opts.devices = req.devices.iter().map(|d| d.path.clone()).collect();
+        save_fs_mounted_with_opts(&req.name, mount_opts).await;
         // Logged inside get_mount_usage on failure.
         let (total, used, available) = get_mount_usage(&mount_point).await.unwrap_or((0, 0, 0));
 
@@ -2699,33 +2530,6 @@ impl FilesystemService {
             .collect();
 
         self.invalidate_list_cache().await;
-
-        // Bind the freshly-stored key to the host TPM2 when the
-        // operator asked for it. Prerequisites (encryption,
-        // store_key, TPM availability) were verified upfront so a
-        // failure here is unexpected — log + return error with a
-        // hint to the WebUI's manual Bind affordance rather than
-        // rolling back the format. The FS exists on disk with valid
-        // data either way; the operator just needs to retry the
-        // bind step.
-        if req.bind_to_tpm == Some(true) {
-            if let Err(e) = self.tpm_bind(&req.name).await {
-                warn!(
-                    "Filesystem '{}' was created but TPM bind failed: {e}. \
-                     The plaintext .key remains on disk; retry via the WebUI's \
-                     'Bind to TPM' button on the Filesystems page.",
-                    req.name
-                );
-                return Err(FilesystemError::CommandFailed(format!(
-                    "filesystem '{}' created but TPM seal failed: {e}",
-                    req.name
-                )));
-            }
-            info!(
-                "Filesystem '{}' created with key sealed to TPM2 (PCR-7 bound)",
-                req.name
-            );
-        }
 
         Ok(Filesystem {
             name: req.name.clone(),
@@ -2783,9 +2587,9 @@ impl FilesystemService {
         }
         let _ = tokio::fs::remove_dir(&mount_dir).await;
 
-        // Wipe bcachefs superblocks from all member devices
+        // Wipe btrfs superblocks from all member devices
         for dev in &fs.devices {
-            info!("Wiping bcachefs superblock on {}", dev.path);
+            info!("Wiping btrfs superblock on {}", dev.path);
             cmd::run_ok("wipefs", &["-a", &dev.path])
                 .await
                 .map_err(|e| {
@@ -2953,75 +2757,17 @@ impl FilesystemService {
             return Err(error);
         }
 
-        let first_device = fs.devices.first().map(|d| d.path.as_str()).unwrap_or("");
-
-        // Unlock decision: ASK BCACHEFS, don't infer.
-        //
-        // `bcachefs show-super` is the only thing that can tell us
-        // authoritatively whether this filesystem needs an unlock
-        // before mount. Three branches:
-        //
-        // 1. show-super succeeds → either unencrypted, or encrypted
-        //    with a key already loaded. Nothing to do; the kernel
-        //    has what it needs for `bcachefs mount`.
-        // 2. show-super fails with "error reading passphrase" →
-        //    encrypted, no usable key reachable. Read a key from
-        //    KEYS_DIR (`.tpm` then `.key`) and `bcachefs unlock`.
-        //    If no key file is present and the kernel keyring is
-        //    empty, the FS is genuinely locked — fail with a clear
-        //    message so the operator unlocks via the WebUI.
-        // 3. show-super fails for some other reason → don't second-
-        //    guess, let `bcachefs mount` produce the canonical error.
-        //
-        // History of getting here wrong (don't undo any of this):
-        // - Originally we gated on `opts.encrypted == Some(true)`,
-        //   but opts.encrypted is derived from show-super output —
-        //   so on encrypted-but-locked FSes it was None (show-super
-        //   failed at boot) and the auto-unlock branch never fired.
-        //   `bcachefs mount` then prompted via systemd-ask-password
-        //   and the engine timed out. Fixed in PR #297.
-        // - PR #297 switched the gate to "if a key file exists,
-        //   unlock unconditionally." That broke the inverse: stale
-        //   `.key` files on unencrypted filesystems (older install
-        //   paths wrote them anyway) caused `bcachefs unlock` to
-        //   reply "device is not encrypted" → the mount path
-        //   propagated the error → filesystems unmounted at boot
-        //   on .0f.ee and 10.10.20.100. The fix below is to probe
-        //   bcachefs FIRST and only attempt unlock when bcachefs
-        //   itself reports the FS as needing one.
-        let unlocked_via_key_file = match probe_needs_unlock(first_device).await {
-            NeedsUnlock::No => false,
-            NeedsUnlock::Yes => {
-                if let Some(bytes) = read_unlock_key(name).await? {
-                    bcachefs_unlock_with_key(first_device, &bytes).await?;
-                    true
-                } else if is_bcachefs_key_loaded(&fs.uuid).await {
-                    // Probe said "needs unlock" but show-super might
-                    // have just raced our key-loading; the keyring
-                    // has it, so let mount try.
-                    false
-                } else {
-                    return Err(FilesystemError::CommandFailed(format!(
-                        "encrypted filesystem '{name}' is locked — unlock it first, then mount."
-                    )));
-                }
-            }
-            NeedsUnlock::Unknown => false,
-        };
-
-        let device_arg = fs
-            .devices
-            .iter()
-            .map(|d| d.path.as_str())
-            .collect::<Vec<_>>()
-            .join(":");
+        // Mount via util-linux. Prefer UUID= so multi-device btrfs
+        // pools resolve correctly even when /proc/mounts later shows
+        // only one member path.
         let mount_opt_str = build_mount_opts(opts);
-        if let Err(e) = cmd::run_ok(
-            "bcachefs",
-            &["mount", "-o", &mount_opt_str, &device_arg, &mount_point],
-        )
-        .await
-        {
+        let uuid_source = format!("UUID={}", fs.uuid);
+        let mut mount_args = vec!["-t", "btrfs"];
+        if !mount_opt_str.is_empty() {
+            mount_args.extend(["-o", mount_opt_str.as_str()]);
+        }
+        mount_args.extend([uuid_source.as_str(), mount_point.as_str()]);
+        if let Err(e) = cmd::run_ok("mount", &mount_args).await {
             // Persist *why* it failed (named missing devices + classified
             // reason) so the WebUI can explain an unmounted pool instead
             // of just showing "Unmounted" — boot-time failures otherwise
@@ -3043,20 +2789,9 @@ impl FilesystemService {
             return Err(FilesystemError::CommandFailed(message));
         }
 
-        // Track mount state with identity info for boot reconciliation.
-        // If we successfully unlocked via a stored key, force the
-        // persisted `encrypted` flag to true: opts.encrypted may have
-        // been None (e.g. older NASty versions didn't always persist
-        // it, or a previous boot's show-super failed and the recorded
-        // value got cleared), and we want next boot's auto-unlock
-        // branch to have the right signal without depending on a
-        // possibly-failing show-super.
         let mut saved_opts = opts.clone();
         saved_opts.uuid = Some(fs.uuid.clone());
         saved_opts.devices = fs.devices.iter().map(|d| d.path.clone()).collect();
-        if unlocked_via_key_file {
-            saved_opts.encrypted = Some(true);
-        }
         save_fs_mounted_with_opts(name, saved_opts).await;
 
         // Mounted cleanly — drop any stale failure record so the banner
@@ -3067,101 +2802,45 @@ impl FilesystemService {
         select_filesystem_for_mount(self.list().await?, name, Some(&fs.uuid))
     }
 
-    /// Unlock an encrypted filesystem with a passphrase (does not mount).
+    /// Unlock is not supported on btrfs builds.
     pub async fn unlock(
         &self,
-        name: &str,
-        passphrase: &str,
+        _name: &str,
+        _passphrase: &str,
     ) -> Result<Filesystem, FilesystemError> {
-        let fs = self.get(name).await?;
-
-        let first_device = fs
-            .devices
-            .first()
-            .map(|d| d.path.clone())
-            .ok_or_else(|| FilesystemError::CommandFailed("no devices".to_string()))?;
-
-        let stdin = format!("{passphrase}\n");
-        cmd::run_ok_stdin(
-            "bcachefs",
-            &["unlock", "-k", "session", &first_device],
-            stdin.as_bytes(),
-        )
-        .await
-        .map_err(FilesystemError::CommandFailed)?;
-
-        info!("Filesystem '{name}' unlocked");
-        self.invalidate_list_cache().await;
-        self.get(name).await
+        Err(FilesystemError::InvalidInput(
+            "encryption unlock is not supported on btrfs builds".into(),
+        ))
     }
 
-    /// Lock an encrypted filesystem: unmount it (if mounted) and revoke
-    /// its key from the kernel keyring. Mirror of `unlock`. After this,
-    /// remounting requires re-entering the passphrase via `unlock`
-    /// (or the stored auto-unlock key, if one is on disk — those two
-    /// concepts are independent; "lock" doesn't delete the stored key,
-    /// `delete_key` does).
-    ///
-    /// No-op (success) if the FS is already locked. Errors out if the
-    /// FS isn't encrypted at all — calling lock on a plain FS is a
-    /// programming bug worth surfacing.
-    pub async fn lock(&self, name: &str) -> Result<Filesystem, FilesystemError> {
-        let fs = self.get(name).await?;
-        if fs.options.encrypted != Some(true) {
-            return Err(FilesystemError::InvalidInput(format!(
-                "filesystem '{name}' is not encrypted"
-            )));
-        }
-        if fs.mounted {
-            self.unmount(name).await?;
-        }
-        match find_bcachefs_key_id(&fs.uuid).await {
-            Some(key_id) => {
-                cmd::run_ok("keyctl", &["unlink", &key_id, "@s"])
-                    .await
-                    .map_err(FilesystemError::CommandFailed)?;
-                info!("Filesystem '{name}' locked (key {key_id} unlinked from session keyring)");
-            }
-            None => {
-                info!("Filesystem '{name}' was already locked (no key in keyring)");
-            }
-        }
-        self.invalidate_list_cache().await;
-        self.get(name).await
+    /// Lock is not supported on btrfs builds.
+    pub async fn lock(&self, _name: &str) -> Result<Filesystem, FilesystemError> {
+        Err(FilesystemError::InvalidInput(
+            "encryption lock is not supported on btrfs builds".into(),
+        ))
     }
 
-    /// Export the stored encryption key for a filesystem.
-    pub async fn export_key(&self, name: &str) -> Result<String, FilesystemError> {
-        let key_path = format!("{KEYS_DIR}/{name}.key");
-        tokio::fs::read_to_string(&key_path).await.map_err(|e| {
-            // Keep the io::Error kind in the message — "permission denied"
-            // vs "not found" is the difference between a real bug and a
-            // user with no stored key.
-            FilesystemError::CommandFailed(format!("read key for '{name}' at {key_path}: {e}"))
-        })
+    /// Export the stored encryption key — unsupported on btrfs builds.
+    pub async fn export_key(&self, _name: &str) -> Result<String, FilesystemError> {
+        Err(FilesystemError::InvalidInput(
+            "encryption keys are not supported on btrfs builds".into(),
+        ))
     }
 
-    /// Delete the stored encryption key (switch to passphrase-only mode).
-    pub async fn delete_key(&self, name: &str) -> Result<(), FilesystemError> {
-        let key_path = format!("{KEYS_DIR}/{name}.key");
-        tokio::fs::remove_file(&key_path).await.map_err(|e| {
-            FilesystemError::CommandFailed(format!("delete key for '{name}' at {key_path}: {e}"))
-        })
+    /// Delete the stored encryption key — unsupported on btrfs builds.
+    pub async fn delete_key(&self, _name: &str) -> Result<(), FilesystemError> {
+        Err(FilesystemError::InvalidInput(
+            "encryption keys are not supported on btrfs builds".into(),
+        ))
     }
 
-    /// TPM2 bind status for filesystem `name`.
-    ///
-    /// `tpm_available` is the host capability (`/dev/tpmrm0` present);
-    /// `bound` is per-FS (a `<name>.tpm` sealed blob exists). The two
-    /// are independent — a host can lose its TPM (firmware downgrade,
-    /// chip swap) and still have a stale `.tpm` file from before.
-    pub async fn tpm_status(&self, name: &str) -> TpmBindStatus {
-        let sealed_path = format!("{KEYS_DIR}/{name}.{TPM_SEALED_SUFFIX}");
+    pub async fn tpm_status(&self, _name: &str) -> TpmBindStatus {
         TpmBindStatus {
-            tpm_available: nasty_common::tpm::is_available().await,
-            bound: Path::new(&sealed_path).exists(),
+            tpm_available: false,
+            bound: false,
         }
     }
+
 
     /// Seal the stored plaintext key with the host TPM and write it
     /// next to the existing `<name>.key` as `<name>.tpm`. The plaintext
@@ -3175,214 +2854,93 @@ impl FilesystemService {
     ///     FS with `store_key=true` first);
     ///   - the FS isn't encrypted at all (programming bug — surfaced
     ///     so it doesn't silently no-op).
-    pub async fn tpm_bind(&self, name: &str) -> Result<TpmBindStatus, FilesystemError> {
-        let fs = self.get(name).await?;
-        if fs.options.encrypted != Some(true) {
-            return Err(FilesystemError::InvalidInput(format!(
-                "filesystem '{name}' is not encrypted"
-            )));
-        }
-        if !nasty_common::tpm::is_available().await {
-            return Err(FilesystemError::CommandFailed(
-                "TPM2 not available on this host".into(),
-            ));
-        }
-
-        let key_path = format!("{KEYS_DIR}/{name}.key");
-        let plaintext = tokio::fs::read(&key_path).await.map_err(|e| {
-            FilesystemError::CommandFailed(format!(
-                "no stored key for '{name}' at {key_path}: {e} — bind requires an existing .key"
-            ))
-        })?;
-
-        let blob = nasty_common::tpm::seal_with_pcr7(&plaintext)
-            .await
-            .map_err(|e| FilesystemError::CommandFailed(format!("tpm seal: {e}")))?;
-        let json = serde_json::to_vec_pretty(&blob)
-            .map_err(|e| FilesystemError::CommandFailed(format!("serialize sealed blob: {e}")))?;
-
-        let sealed_path = format!("{KEYS_DIR}/{name}.{TPM_SEALED_SUFFIX}");
-        tokio::fs::write(&sealed_path, &json)
-            .await
-            .map_err(|e| FilesystemError::CommandFailed(format!("write {sealed_path}: {e}")))?;
-        info!("Filesystem '{name}' key sealed to TPM at {sealed_path}");
-
-        Ok(self.tpm_status(name).await)
+    pub async fn tpm_bind(&self, _name: &str) -> Result<TpmBindStatus, FilesystemError> {
+        Err(FilesystemError::InvalidInput(
+            "TPM key binding is not supported on btrfs builds".into(),
+        ))
     }
 
-    /// Remove the TPM-sealed copy of the key. The plaintext `.key`
-    /// (if present) is unaffected — auto-unlock continues working off
-    /// it. No-op (success) when no sealed blob exists.
-    pub async fn tpm_unbind(&self, name: &str) -> Result<TpmBindStatus, FilesystemError> {
-        let sealed_path = format!("{KEYS_DIR}/{name}.{TPM_SEALED_SUFFIX}");
-        match tokio::fs::remove_file(&sealed_path).await {
-            Ok(()) => info!("Filesystem '{name}' TPM seal removed ({sealed_path})"),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(FilesystemError::CommandFailed(format!(
-                    "remove {sealed_path}: {e}"
-                )));
-            }
-        }
-        Ok(self.tpm_status(name).await)
+    pub async fn tpm_unbind(&self, _name: &str) -> Result<TpmBindStatus, FilesystemError> {
+        Err(FilesystemError::InvalidInput(
+            "TPM key binding is not supported on btrfs builds".into(),
+        ))
     }
 
-    /// Update runtime-mutable options on a mounted filesystem via sysfs.
     pub async fn update_options(
         &self,
         req: UpdateFilesystemOptionsRequest,
     ) -> Result<Filesystem, FilesystemError> {
+        // Hard-error bcachefs-only policy knobs; allow compression remount.
+        if req.erasure_code.is_some()
+            || req.foreground_target.is_some()
+            || req.background_target.is_some()
+            || req.promote_target.is_some()
+            || req.metadata_target.is_some()
+            || req.data_replicas.is_some()
+            || req.metadata_replicas.is_some()
+            || req.background_compression.is_some()
+            || req.data_checksum.is_some()
+            || req.metadata_checksum.is_some()
+            || req.error_action.is_some()
+            || req.move_ios_in_flight.is_some()
+            || req.move_bytes_in_flight.is_some()
+            || req.journal_flush_delay.is_some()
+            || req.journal_flush_disabled.is_some()
+            || req.version_upgrade.is_some()
+            || req.verbose.is_some()
+            || req.fsck.is_some()
+        {
+            return Err(FilesystemError::InvalidInput(
+                "bcachefs-specific filesystem options are not supported on btrfs builds".into(),
+            ));
+        }
         let fs = self.get(&req.name).await?;
         if !fs.mounted {
             return Err(FilesystemError::CommandFailed(
                 "filesystem must be mounted to update options".to_string(),
             ));
         }
-        // Validate compression specs up front so a typo in the level
-        // can't leave foreground set and background rejected halfway
-        // through the sysfs writes below.
-        for spec in [&req.compression, &req.background_compression]
-            .into_iter()
-            .flatten()
-        {
-            validate_compression(spec).map_err(FilesystemError::InvalidInput)?;
-        }
-
-        let uuid = &fs.uuid;
-        let base = format!("/sys/fs/bcachefs/{uuid}/options");
-
-        async fn write_opt(base: &str, name: &str, value: &str) -> Result<(), FilesystemError> {
-            let path = format!("{base}/{name}");
-            let v = if value.is_empty() { "none" } else { value };
-            tokio::fs::write(&path, v)
-                .await
-                .map_err(|e| FilesystemError::CommandFailed(format!("failed to set {name}: {e}")))
-        }
-
-        if let Some(ref v) = req.compression {
-            write_opt(&base, "compression", v).await?;
-        }
-        if let Some(ref v) = req.background_compression {
-            write_opt(&base, "background_compression", v).await?;
-        }
-        if let Some(ref v) = req.foreground_target {
-            write_opt(&base, "foreground_target", v).await?;
-        }
-        if let Some(ref v) = req.background_target {
-            write_opt(&base, "background_target", v).await?;
-        }
-        if let Some(ref v) = req.promote_target {
-            write_opt(&base, "promote_target", v).await?;
-        }
-        if let Some(ref v) = req.metadata_target {
-            write_opt(&base, "metadata_target", v).await?;
-        }
-        if let Some(ref v) = req.error_action {
-            write_opt(&base, "errors", v).await?;
-        }
-        if let Some(ec) = req.erasure_code {
-            write_opt(&base, "erasure_code", if ec { "1" } else { "0" }).await?;
-        }
-        if let Some(ref v) = req.data_checksum {
-            write_opt(&base, "data_checksum", v).await?;
-        }
-        if let Some(ref v) = req.metadata_checksum {
-            write_opt(&base, "metadata_checksum", v).await?;
-        }
-        if let Some(v) = req.data_replicas {
-            write_opt(&base, "data_replicas", &v.to_string()).await?;
-        }
-        if let Some(v) = req.metadata_replicas {
-            write_opt(&base, "metadata_replicas", &v.to_string()).await?;
-        }
-        if let Some(v) = req.move_ios_in_flight {
-            write_opt(&base, "move_ios_in_flight", &v.to_string()).await?;
-        }
-        if let Some(ref v) = req.move_bytes_in_flight {
-            write_opt(&base, "move_bytes_in_flight", v).await?;
-        }
-        if let Some(v) = req.journal_flush_delay {
-            write_opt(&base, "journal_flush_delay", &v.to_string()).await?;
-        }
-
-        // Mount options require a remount to take effect — but only if they actually changed.
-        let state = load_fs_state().await;
-        let current = state.get(&req.name).cloned().unwrap_or_default();
-        let mount_changed = (req.version_upgrade.is_some()
-            && req.version_upgrade != current.version_upgrade)
-            || (req.degraded.is_some() && req.degraded != current.degraded)
-            || (req.verbose.is_some() && req.verbose != current.verbose)
-            || (req.fsck.is_some() && req.fsck != current.fsck)
-            || (req.journal_flush_disabled.is_some()
-                && req.journal_flush_disabled != current.journal_flush_disabled)
-            || (req.journal_flush_delay.is_some()
-                && req.journal_flush_delay != current.journal_flush_delay);
-        drop(state);
-
-        if mount_changed {
+        if let Some(ref comp) = req.compression {
+            validate_compression(comp).map_err(FilesystemError::InvalidInput)?;
             let mut state = load_fs_state().await;
-            {
-                let opts = state.entry(req.name.clone()).or_default();
-                opts.uuid = Some(fs.uuid.clone());
-                opts.devices = fs
-                    .devices
-                    .iter()
-                    .map(|device| device.path.clone())
-                    .collect();
-                if let Some(ref v) = req.version_upgrade {
-                    opts.version_upgrade = Some(v.clone());
-                }
-                if let Some(v) = req.degraded {
-                    opts.degraded = Some(v);
-                }
-                if let Some(v) = req.verbose {
-                    opts.verbose = Some(v);
-                }
-                if let Some(v) = req.fsck {
-                    opts.fsck = Some(v);
-                }
-                if let Some(v) = req.journal_flush_disabled {
-                    opts.journal_flush_disabled = Some(v);
-                }
-                if let Some(v) = req.journal_flush_delay {
-                    opts.journal_flush_delay = Some(v);
-                }
+            let opts = state.entry(req.name.clone()).or_default();
+            opts.uuid = Some(fs.uuid.clone());
+            opts.devices = fs.devices.iter().map(|d| d.path.clone()).collect();
+            opts.compression = if comp.is_empty() || comp == "none" {
+                None
+            } else {
+                Some(comp.clone())
+            };
+            if req.degraded.is_some() {
+                opts.degraded = req.degraded;
             }
-            if let Err(e) = save_fs_state(&state).await {
-                // The runtime FS state is updated in memory, but at next
-                // boot we'll fall back to whatever was last persisted —
-                // so user-tweaked mount options silently revert. Log so
-                // the user can match a "my settings keep resetting"
-                // bug to the persistence failure that caused it.
-                warn!("save_fs_state after option update failed: {e}");
-            }
-        }
-
-        if mount_changed {
-            // Remount in-place (no unmount needed, works even when busy)
-            let mount_point = fs.mount_point.as_deref().ok_or_else(|| {
-                FilesystemError::CommandFailed(format!(
-                    "filesystem '{}' has no active mount point to remount",
-                    req.name
-                ))
+            let mount_opt_str = build_mount_opts(opts);
+            let remount = if mount_opt_str.is_empty() {
+                "remount".to_string()
+            } else {
+                format!("remount,{mount_opt_str}")
+            };
+            let mp = fs.mount_point.clone().ok_or_else(|| {
+                FilesystemError::CommandFailed("filesystem has no mount point".into())
             })?;
-            verify_mountpoint_identity(mount_point, &fs.uuid).await?;
-            let state = load_fs_state().await;
-            let mount_opt_str =
-                build_mount_opts(state.get(&req.name).unwrap_or(&FsMountOptions::default()));
-            cmd::run_ok(
-                "mount",
-                &["-o", &format!("remount,{mount_opt_str}"), mount_point],
-            )
-            .await
-            .map_err(FilesystemError::CommandFailed)?;
-            self.invalidate_list_cache().await;
-            return self.get(&req.name).await;
+            cmd::run_ok("mount", &["-o", &remount, &mp])
+                .await
+                .map_err(FilesystemError::CommandFailed)?;
+            if let Err(e) = save_fs_state(&state).await {
+                warn!("save_fs_state after options update failed: {e}");
+            }
+        } else if let Some(degraded) = req.degraded {
+            let mut state = load_fs_state().await;
+            let opts = state.entry(req.name.clone()).or_default();
+            opts.degraded = Some(degraded);
+            if let Err(e) = save_fs_state(&state).await {
+                warn!("save_fs_state after options update failed: {e}");
+            }
         }
-
         self.invalidate_list_cache().await;
         self.get(&req.name).await
     }
+
 
     /// Unmount a filesystem
     pub async fn unmount(&self, name: &str) -> Result<(), FilesystemError> {
@@ -3485,7 +3043,7 @@ impl FilesystemService {
                         let dev_field = line.split_whitespace().next().unwrap_or("");
                         resolve_mount_devices(
                             dev_field.split(':').map(String::from).collect::<Vec<_>>(),
-                            std::path::Path::new(SYSFS_BCACHEFS),
+                            std::path::Path::new(SYSFS_BTRFS),
                         )
                     })
                     .collect();
@@ -3583,7 +3141,10 @@ impl FilesystemService {
                             mount_point: mountpoint,
                             fs_type: fstype,
                             fs_uuid,
+                            // Holders are filled in after the lsblk walk.
                             in_use: in_fs || actually_mounted,
+                            holders: Vec::new(),
+                            wipeable: !(in_fs || actually_mounted),
                             rotational,
                             device_class,
                             model,
@@ -3649,16 +3210,47 @@ impl FilesystemService {
                 &mut partition_parents,
             );
 
+            // Attach sysfs holders (md/dm) and mark held devices in use.
+            for device in &mut devices {
+                if device.dev_type != "disk" && device.dev_type != "part" {
+                    continue;
+                }
+                device.holders = read_sysfs_holders(&device.path).await;
+                if !device.holders.is_empty() {
+                    device.in_use = true;
+                }
+            }
+
             // Parentage comes from lsblk's device tree. Device names may end
             // in digits, so prefix trimming is not a valid partition parser.
-            let in_use_parents: std::collections::HashSet<&str> = devices
+            let hard_busy_parents: std::collections::HashSet<&str> = devices
                 .iter()
-                .filter(|device| device.in_use && device.dev_type == "part")
+                .filter(|device| {
+                    device.dev_type == "part"
+                        && !device.wipeable
+                        && partition_parents.contains_key(&device.path)
+                })
+                .filter_map(|device| partition_parents.get(&device.path).map(String::as_str))
+                .collect();
+            let held_parents: std::collections::HashSet<&str> = devices
+                .iter()
+                .filter(|device| {
+                    device.dev_type == "part"
+                        && device.in_use
+                        && partition_parents.contains_key(&device.path)
+                })
                 .filter_map(|device| partition_parents.get(&device.path).map(String::as_str))
                 .collect();
             for device in &mut devices {
-                if device.dev_type == "disk" && in_use_parents.contains(device.path.as_str()) {
+                if device.dev_type != "disk" {
+                    continue;
+                }
+                if hard_busy_parents.contains(device.path.as_str()) {
                     device.in_use = true;
+                    device.wipeable = false;
+                } else if held_parents.contains(device.path.as_str()) {
+                    device.in_use = true;
+                    // Still wipeable: device.wipe releases partition holders.
                 }
             }
         }
@@ -3730,6 +3322,8 @@ impl FilesystemService {
                             fs_type: None,
                             fs_uuid: None,
                             in_use: false,
+                            holders: Vec::new(),
+                            wipeable: false,
                             rotational,
                             device_class,
                             model,
@@ -3757,7 +3351,8 @@ impl FilesystemService {
     }
 
     /// Wipe all filesystem signatures from a device.
-    /// Only allowed if the device is not currently in use by any filesystem.
+    /// Releases md/dm/swap holders first. Refuses when the device (or a
+    /// holder in its chain) is mounted or a managed filesystem member.
     pub async fn device_wipe(&self, path: &str) -> Result<(), FilesystemError> {
         let _mutation_guard = self.block_mutations.lock().await;
         let devices = self.list_devices().await?;
@@ -3765,11 +3360,32 @@ impl FilesystemService {
             .iter()
             .find(|d| d.path == path)
             .ok_or_else(|| FilesystemError::CommandFailed(format!("device not found: {path}")))?;
-        if dev.in_use {
+        if !dev.wipeable {
+            let reason = if let Some(mount) = &dev.mount_point {
+                format!("mounted at {mount}")
+            } else if !dev.holders.is_empty() {
+                format!("held by {} and not reclaimable", dev.holders.join(", "))
+            } else {
+                "currently in use by a mounted filesystem".to_string()
+            };
             return Err(FilesystemError::CommandFailed(format!(
-                "device {path} is currently in use"
+                "device {path} cannot be wiped ({reason})"
             )));
         }
+
+        let inventory = read_block_inventory().await?;
+        let node = inventory
+            .get_path(path)
+            .ok_or_else(|| FilesystemError::DeviceNotFound(path.to_string()))?;
+        let mut roots = vec![path.to_string()];
+        roots.extend(
+            inventory
+                .descendants(node)
+                .into_iter()
+                .map(|child| child.path.clone()),
+        );
+        release_holders_for_wipe(&roots).await?;
+
         info!("Wiping device {path}");
         cmd::run_ok("wipefs", &["-a", path])
             .await
@@ -3797,76 +3413,10 @@ impl FilesystemService {
 
     /// Add a device to an existing mounted filesystem.
     /// bcachefs device add [--label=X] [--durability=X] <mountpoint> <device>
-    pub async fn device_add(&self, req: DeviceAddRequest) -> Result<Filesystem, FilesystemError> {
-        let _mutation_guard = self.block_mutations.lock().await;
-        let fs = self.get(&req.filesystem).await?;
-        if !fs.mounted {
-            return Err(FilesystemError::CommandFailed(
-                "filesystem must be mounted to add a device".to_string(),
-            ));
-        }
-        let mount_point = fs.mount_point.as_ref().unwrap().clone();
-
-        if !Path::new(&req.device.path).exists() {
-            return Err(FilesystemError::DeviceNotFound(req.device.path.clone()));
-        }
-
-        // Reject if the device is actively in use (mounted or member of a live filesystem).
-        let known_devices = self.list_devices().await?;
-        if known_devices
-            .iter()
-            .any(|d| d.path == req.device.path && d.in_use)
-        {
-            return Err(FilesystemError::DeviceInUse(req.device.path.clone()));
-        }
-        // Reject if the device has a filesystem signature (including stale bcachefs superblocks
-        // left over after removal). The user must explicitly wipe it via Disks → Wipe first —
-        // unless the superblock belongs to *this* filesystem and a member slot is offline, in
-        // which case the right move is a re-attach, not a wipe (#472).
-        if is_device_bcachefs(&req.device.path).await {
-            let same_fs = get_fs_uuid(&req.device.path).await.as_deref() == Some(fs.uuid.as_str());
-            let has_missing_member = fs.devices.iter().any(|d| d.missing == Some(true));
-            return Err(FilesystemError::CommandFailed(
-                if same_fs && has_missing_member {
-                    format!(
-                        "{} is an offline member of this filesystem. Use \"Bring online\" to re-attach it with its data intact instead of adding it as a new device.",
-                        req.device.path
-                    )
-                } else if same_fs {
-                    format!(
-                        "{} is a former member of this filesystem. Go to Disks → Wipe to erase its old superblock before re-adding it as a new device.",
-                        req.device.path
-                    )
-                } else {
-                    format!(
-                        "{} has an existing bcachefs superblock. Go to Disks → Wipe to erase it before adding it to a filesystem.",
-                        req.device.path
-                    )
-                },
-            ));
-        }
-
-        let mut args: Vec<String> = vec!["device".into(), "add".into()];
-        if let Some(ref label) = req.device.label {
-            args.push(format!("--label={label}"));
-        }
-        if let Some(durability) = req.device.durability {
-            args.push(format!("--durability={durability}"));
-        }
-        args.push(mount_point.clone());
-        args.push(req.device.path.clone());
-
-        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        info!(
-            "Adding device {} to filesystem '{}'",
-            req.device.path, req.filesystem
-        );
-        cmd::run_ok("bcachefs", &arg_refs)
-            .await
-            .map_err(FilesystemError::CommandFailed)?;
-
-        self.invalidate_list_cache().await;
-        self.get(&req.filesystem).await
+    pub async fn device_add(&self, _req: DeviceAddRequest) -> Result<Filesystem, FilesystemError> {
+        Err(FilesystemError::InvalidInput(
+            "device add is not supported on btrfs builds yet".into(),
+        ))
     }
 
     /// Remove a device from a mounted filesystem.
@@ -3874,94 +3424,20 @@ impl FilesystemService {
     /// bcachefs device remove <device> <mountpoint>
     pub async fn device_remove(
         &self,
-        req: DeviceActionRequest,
+        _req: DeviceActionRequest,
     ) -> Result<Filesystem, FilesystemError> {
-        let fs = self.get(&req.filesystem).await?;
-        if !fs.mounted {
-            return Err(FilesystemError::CommandFailed(
-                "filesystem must be mounted to remove a device".to_string(),
-            ));
-        }
-        let mount_point = fs.mount_point.as_ref().unwrap();
-
-        info!(
-            "Removing device {} from filesystem '{}'{}",
-            req.device,
-            req.filesystem,
-            if req.force { " (forced)" } else { "" }
-        );
-        // `req.device` is a path for present devices, or a numeric member
-        // index for a missing/dead member (no /dev node). `bcachefs device
-        // remove` accepts both, with the mount point as the trailing PATH
-        // arg. For a missing member nothing can be migrated off, so force
-        // both data and metadata — safe while enough replicas survive.
-        let mut args = vec!["device", "remove"];
-        if req.force {
-            args.push("--force");
-            args.push("--force-metadata");
-        }
-        args.push(&req.device);
-        args.push(mount_point);
-        cmd::run_ok_bulk("bcachefs", &args)
-            .await
-            .map_err(FilesystemError::CommandFailed)?;
-
-        self.invalidate_list_cache().await;
-        self.get(&req.filesystem).await
+        Err(FilesystemError::InvalidInput(
+            "device remove is not supported on btrfs builds yet".into(),
+        ))
     }
 
     /// Evacuate all data off a device (move to other devices in the filesystem).
     /// This is a prerequisite for safe device removal.
     /// bcachefs device evacuate <device>
-    pub async fn device_evacuate(&self, req: DeviceActionRequest) -> Result<(), FilesystemError> {
-        let fs = self.get(&req.filesystem).await?;
-        if !fs.mounted {
-            return Err(FilesystemError::CommandFailed(
-                "filesystem must be mounted to evacuate a device".to_string(),
-            ));
-        }
-
-        // Refuse a second evacuation of the same device: either the
-        // spawned `bcachefs device evacuate` is still running (tracked
-        // in-process — bcachefs takes a moment to persist `evacuating`,
-        // and hammering the button in that window must not spawn
-        // parallel migrations, #479), or the device state already says
-        // so.
-        {
-            let mut inflight = self.evacuating.lock().await;
-            let state_says_evacuating = fs
-                .devices
-                .iter()
-                .any(|d| d.path == req.device && d.state.as_deref() == Some("evacuating"));
-            if state_says_evacuating || inflight.contains(&req.device) {
-                return Err(FilesystemError::CommandFailed(format!(
-                    "evacuation of {} is already in progress",
-                    req.device
-                )));
-            }
-            inflight.insert(req.device.clone());
-        }
-
-        let device = req.device.clone();
-        let fs_name = req.filesystem.clone();
-        let evacuating = self.evacuating.clone();
-        info!(
-            "Starting evacuation of device {} in filesystem '{}'",
-            device, fs_name
-        );
-
-        // Spawn evacuation in background — this can take hours for large devices.
-        // bcachefs sets the device state to "evacuating" automatically.
-        tokio::spawn(async move {
-            match cmd::run_ok_bulk("bcachefs", &["device", "evacuate", &device]).await {
-                Ok(_) => info!("Evacuation of {} in '{}' completed", device, fs_name),
-                Err(e) => warn!("Evacuation of {} in '{}' failed: {}", device, fs_name, e),
-            }
-            evacuating.lock().await.remove(&device);
-        });
-
-        self.invalidate_list_cache().await;
-        Ok(())
+    pub async fn device_evacuate(&self, _req: DeviceActionRequest) -> Result<(), FilesystemError> {
+        Err(FilesystemError::InvalidInput(
+            "device evacuate is not supported on btrfs builds".into(),
+        ))
     }
 
     /// Cancel a running device evacuation: terminate the
@@ -3972,109 +3448,45 @@ impl FilesystemService {
     /// (#553)
     pub async fn device_evacuate_cancel(
         &self,
-        name: &str,
-        device: &str,
+        _name: &str,
+        _device: &str,
     ) -> Result<(), FilesystemError> {
-        let fs = self.get(name).await?;
-        if !fs.devices.iter().any(|d| d.path == device) {
-            return Err(FilesystemError::CommandFailed(format!(
-                "{device} is not a member of filesystem '{name}'"
-            )));
-        }
-        let pattern = format!("bcachefs device evacuate {device}");
-        info!("Cancelling evacuation of {device} on '{name}' via pkill -TERM -f '{pattern}'");
-        nasty_common::cmd::try_run("pkill", &["-TERM", "-f", &pattern]).await;
-        self.evacuating.lock().await.remove(device);
-        // Return the device to read-write so it's usable again; the
-        // partial drain is harmless (replicas were preserved throughout).
-        nasty_common::cmd::try_run("bcachefs", &["device", "set-state", "rw", device]).await;
-        self.invalidate_list_cache().await;
-        Ok(())
+        Err(FilesystemError::InvalidInput(
+            "device evacuate is not supported on btrfs builds".into(),
+        ))
     }
 
     /// Change the persistent state of a device (rw, ro, failed, spare).
     /// bcachefs device set-state <new_state> <device> [path]
     pub async fn device_set_state(
         &self,
-        req: DeviceSetStateRequest,
+        _req: DeviceSetStateRequest,
     ) -> Result<Filesystem, FilesystemError> {
-        let valid_states = ["rw", "ro", "failed", "spare"];
-        if !valid_states.contains(&req.state.as_str()) {
-            return Err(FilesystemError::CommandFailed(format!(
-                "invalid device state '{}', must be one of: {}",
-                req.state,
-                valid_states.join(", ")
-            )));
-        }
-
-        let fs = self.get(&req.filesystem).await?;
-        if !fs.mounted {
-            return Err(FilesystemError::CommandFailed(
-                "filesystem must be mounted to change device state".to_string(),
-            ));
-        }
-        info!(
-            "Setting device {} state to '{}' in filesystem '{}'",
-            req.device, req.state, req.filesystem
-        );
-        cmd::run_ok(
-            "bcachefs",
-            &["device", "set-state", &req.state, &req.device],
-        )
-        .await
-        .map_err(FilesystemError::CommandFailed)?;
-
-        self.invalidate_list_cache().await;
-        self.get(&req.filesystem).await
+        Err(FilesystemError::InvalidInput(
+            "device set-state is not supported on btrfs builds".into(),
+        ))
     }
 
     /// Bring a device online (temporary, no membership change).
     /// bcachefs device online <device>
     pub async fn device_online(
         &self,
-        req: DeviceActionRequest,
+        _req: DeviceActionRequest,
     ) -> Result<Filesystem, FilesystemError> {
-        let fs = self.get(&req.filesystem).await?;
-        if !fs.mounted {
-            return Err(FilesystemError::CommandFailed(
-                "filesystem must be mounted to online a device".to_string(),
-            ));
-        }
-
-        info!(
-            "Onlining device {} in filesystem '{}'",
-            req.device, req.filesystem
-        );
-        cmd::run_ok("bcachefs", &["device", "online", &req.device])
-            .await
-            .map_err(FilesystemError::CommandFailed)?;
-
-        self.invalidate_list_cache().await;
-        self.get(&req.filesystem).await
+        Err(FilesystemError::InvalidInput(
+            "device online is not supported on btrfs builds yet".into(),
+        ))
     }
 
     /// Take a device offline (temporary, no membership change).
     /// bcachefs device offline <device>
     pub async fn device_offline(
         &self,
-        req: DeviceActionRequest,
+        _req: DeviceActionRequest,
     ) -> Result<Filesystem, FilesystemError> {
-        let fs = self.get(&req.filesystem).await?;
-        if !fs.mounted {
-            return Err(FilesystemError::CommandFailed(
-                "filesystem must be mounted to offline a device".to_string(),
-            ));
-        }
-        info!(
-            "Offlining device {} in filesystem '{}'",
-            req.device, req.filesystem
-        );
-        cmd::run_ok("bcachefs", &["device", "offline", &req.device])
-            .await
-            .map_err(FilesystemError::CommandFailed)?;
-
-        self.invalidate_list_cache().await;
-        self.get(&req.filesystem).await
+        Err(FilesystemError::InvalidInput(
+            "device offline is not supported on btrfs builds yet".into(),
+        ))
     }
 
     /// Set the label on a device of a mounted filesystem via the bcachefs sysfs interface.
@@ -4084,65 +3496,11 @@ impl FilesystemService {
     /// live filesystem; we find the right dev-N by matching the `block` symlink.
     pub async fn device_set_label(
         &self,
-        req: DeviceSetLabelRequest,
+        _req: DeviceSetLabelRequest,
     ) -> Result<Filesystem, FilesystemError> {
-        let fs = self.get(&req.filesystem).await?;
-        if !fs.mounted {
-            return Err(FilesystemError::CommandFailed(
-                "filesystem must be mounted to set a device label".to_string(),
-            ));
-        }
-
-        // Validate: device must be a member of the filesystem
-        if !fs.devices.iter().any(|d| d.path == req.device) {
-            return Err(FilesystemError::CommandFailed(format!(
-                "{} is not a member of filesystem '{}'",
-                req.device, req.filesystem
-            )));
-        }
-
-        // Find the sysfs dev-N directory whose `block` symlink resolves to our device.
-        // The symlink target ends with the kernel device name (e.g. "sdc").
-        let dev_name = req.device.trim_start_matches("/dev/");
-        let sysfs_base = format!("/sys/fs/bcachefs/{}", fs.uuid);
-        let mut label_path: Option<std::path::PathBuf> = None;
-
-        let mut rd = tokio::fs::read_dir(&sysfs_base).await.map_err(|e| {
-            FilesystemError::CommandFailed(format!("failed to read sysfs {sysfs_base}: {e}"))
-        })?;
-        while let Ok(Some(entry)) = rd.next_entry().await {
-            let name = entry.file_name();
-            if !name.to_string_lossy().starts_with("dev-") {
-                continue;
-            }
-            let block_link = entry.path().join("block");
-            if let Ok(target) = tokio::fs::read_link(&block_link).await
-                && target.file_name().map(|n| n == dev_name).unwrap_or(false)
-            {
-                label_path = Some(entry.path().join("label"));
-                break;
-            }
-        }
-
-        let label_path = label_path.ok_or_else(|| {
-            FilesystemError::CommandFailed(format!(
-                "could not find sysfs entry for {} in filesystem '{}'",
-                req.device, req.filesystem
-            ))
-        })?;
-
-        info!(
-            "Setting label '{}' on {} in filesystem '{}'",
-            req.label, req.device, req.filesystem
-        );
-        tokio::fs::write(&label_path, &req.label)
-            .await
-            .map_err(|e| {
-                FilesystemError::CommandFailed(format!("failed to write sysfs label: {e}"))
-            })?;
-
-        self.invalidate_list_cache().await;
-        self.get(&req.filesystem).await
+        Err(FilesystemError::InvalidInput(
+            "device set-label is not supported on btrfs builds".into(),
+        ))
     }
 
     // ── Filesystem health & monitoring ────────────────────────────────
@@ -4156,80 +3514,19 @@ impl FilesystemService {
             ));
         }
         let mount_point = fs.mount_point.as_ref().unwrap();
-
-        let raw = cmd::run_ok("bcachefs", &["fs", "usage", mount_point])
+        let raw = cmd::run_ok("btrfs", &["filesystem", "usage", "-b", mount_point])
             .await
             .map_err(FilesystemError::CommandFailed)?;
-
-        // Also get -a output for per-device btree/user breakdown
-        let raw_all = cmd::run_ok("bcachefs", &["fs", "usage", "-a", mount_point])
-            .await
-            .unwrap_or_default();
-
-        let mut dev_usages = Vec::new();
-        let mut data_bytes: u64 = 0;
-        let mut metadata_bytes: u64 = 0;
-        let mut reserved_bytes: u64 = 0;
-
-        // Parse default output for summary: "Used:", "Online reserved:"
-        // and device table: "label (device N):  devname  state  size  used  use%"
-        for line in raw.lines() {
-            let trimmed = line.trim();
-            let lower = trimmed.to_lowercase();
-
-            if lower.starts_with("used:") {
-                if let Some(bytes) = extract_first_bytes(trimmed) {
-                    data_bytes = bytes; // "Used" is total used (data + metadata)
-                }
-            } else if lower.starts_with("online reserved:")
-                && let Some(bytes) = extract_first_bytes(trimmed)
-            {
-                reserved_bytes = bytes;
-            }
-
-            // Device table row: "label (device N):  sdb  rw  53264510976  8912896  0%"
-            if trimmed.contains("(device")
-                && trimmed.contains("):")
-                && let Some(du) = parse_device_table_line(trimmed)
-            {
-                dev_usages.push(du);
-            }
-        }
-
-        // Parse -a output to sum btree (metadata) vs user (data) across devices.
-        // Per-device sections start with "label (device N):" and contain indented rows:
-        //   btree:  8912896  ...
-        //   user:   0        ...
-        let mut total_btree: u64 = 0;
-        let mut total_user: u64 = 0;
-        for line in raw_all.lines() {
-            let trimmed = line.trim();
-            // Indented rows inside per-device sections
-            if trimmed.starts_with("btree:") {
-                if let Some(bytes) = extract_first_bytes(trimmed) {
-                    total_btree += bytes;
-                }
-            } else if trimmed.starts_with("user:")
-                && let Some(bytes) = extract_first_bytes(trimmed)
-            {
-                total_user += bytes;
-            }
-        }
-
-        // Use the per-type breakdown if available
-        if total_btree > 0 || total_user > 0 {
-            metadata_bytes = total_btree;
-            data_bytes = total_user;
-        }
-
+        let (total, used, _avail) = get_mount_usage(mount_point).await.unwrap_or((0, 0, 0));
         Ok(FsUsage {
             raw,
-            devices: dev_usages,
-            data_bytes,
-            metadata_bytes,
-            reserved_bytes,
+            devices: Vec::new(),
+            data_bytes: used,
+            metadata_bytes: 0,
+            reserved_bytes: total.saturating_sub(used),
         })
     }
+
 
     /// Start a data scrub on a filesystem.
     /// `bcachefs scrub <mountpoint>`. The bcachefs binary blocks for
@@ -4380,7 +3677,8 @@ impl FilesystemService {
         }
 
         self.scrub_cancels.lock().await.insert(name.to_string());
-        let pattern = format!("bcachefs scrub {mount}");
+        let _ = cmd::run_ok("btrfs", &["scrub", "cancel", &mount]).await;
+        let pattern = format!("btrfs scrub start -Bd {mount}");
         info!("Cancelling scrub on '{name}' via pkill -TERM -f '{pattern}'");
         // pkill exits 1 when nothing matched — fine; the child may have
         // just finished. The completion path still clears `running`.
@@ -4427,7 +3725,7 @@ impl FilesystemService {
             // at all there's nothing for bcachefs scrub to be running
             // against, so we treat that as "definitely not alive".
             let alive = if let Some(mp) = fs.mount_point.as_deref() {
-                cmd::run_ok("pgrep", &["-fa", "bcachefs scrub"])
+                cmd::run_ok("pgrep", &["-fa", "btrfs scrub"])
                     .await
                     .map(|out| out.lines().any(|l| l.contains(mp)))
                     .unwrap_or(false)
@@ -4462,7 +3760,7 @@ impl FilesystemService {
                     entry.last_duration_secs = Some(duration);
                     entry.last_outcome = Some(ScrubOutcome::Failed);
                     entry.last_output = Some(
-                        "engine restarted while scrub was running — the bcachefs child \
+                        "engine restarted while scrub was running — the btrfs scrub child \
                          was lost; restart the scrub if you want a fresh full pass."
                             .into(),
                     );
@@ -4485,88 +3783,12 @@ impl FilesystemService {
     /// Refuses while mounted — offline fsck needs exclusive access, and
     /// the won't-mount case (#451) is already unmounted. Runs detached
     /// and streams output, mirroring `scrub_start`.
-    pub async fn fsck_start(&self, name: &str, repair: bool) -> Result<(), FilesystemError> {
-        let fs = self.get(name).await?;
-        if fs.mounted {
-            return Err(FilesystemError::CommandFailed(
-                "unmount the filesystem before running fsck (an offline check needs exclusive \
-                 access to the member devices)"
-                    .to_string(),
-            ));
-        }
-        let devices: Vec<String> = fs.devices.iter().map(|d| d.path.clone()).collect();
-        if devices.is_empty() {
-            return Err(FilesystemError::CommandFailed(
-                "no member devices found to check".to_string(),
-            ));
-        }
-        // Refuse a second concurrent run.
-        if self
-            .fsck_state
-            .lock()
-            .await
-            .get(name)
-            .is_some_and(|s| s.running)
-        {
-            return Err(FilesystemError::CommandFailed(
-                "an fsck is already running on this filesystem".to_string(),
-            ));
-        }
-
-        let fs_name = name.to_string();
-        let now = unix_now_secs();
-        let ownership = LocalOperationReservation::acquire(&self.local_fscks, fs_name.clone())
-            .ok_or_else(|| {
-                FilesystemError::CommandFailed(
-                    "an fsck is already running on this filesystem".to_string(),
-                )
-            })?;
-        {
-            let mut state = self.fsck_state.lock().await;
-            let entry = state.entry(fs_name.clone()).or_default();
-            entry.running = true;
-            entry.repair = repair;
-            entry.started_at = Some(now);
-            entry.progress_percent = None;
-        }
-        persist_fsck_state(&self.fsck_state).await;
-
-        let store = self.fsck_state.clone();
-        info!(
-            "Starting fsck ({}) on filesystem '{name}'",
-            if repair { "repair" } else { "dry run" }
-        );
-        tokio::spawn(async move {
-            let (outcome, captured) =
-                stream_fsck_and_collect(&devices, &fs_name, &store, repair).await;
-            let end = unix_now_secs();
-            let duration = (end - now).max(0) as u64;
-            match outcome {
-                FsckOutcome::Clean => info!("fsck on '{fs_name}' completed in {duration}s: clean"),
-                FsckOutcome::Errors => warn!(
-                    "fsck on '{fs_name}' completed in {duration}s: errors reported (see WebUI for full output)"
-                ),
-                FsckOutcome::Failed => warn!("fsck on '{fs_name}' failed after {duration}s"),
-            }
-            let truncated = truncate_tail(&captured, SCRUB_OUTPUT_KEEP_BYTES);
-            {
-                let mut state = store.lock().await;
-                let entry = state.entry(fs_name.clone()).or_default();
-                entry.running = false;
-                entry.started_at = None;
-                entry.progress_percent = None;
-                entry.last_run_at = Some(end);
-                entry.last_duration_secs = Some(duration);
-                entry.last_repair = Some(repair);
-                entry.last_outcome = Some(outcome);
-                entry.last_output = Some(truncated);
-            }
-            persist_fsck_state(&store).await;
-            drop(ownership);
-        });
-
-        Ok(())
+    pub async fn fsck_start(&self, _name: &str, _repair: bool) -> Result<(), FilesystemError> {
+        Err(FilesystemError::InvalidInput(
+            "offline fsck via this RPC is not supported on btrfs builds yet (use btrfs check manually)".into(),
+        ))
     }
+
 
     /// Get fsck status for a filesystem, with a `pgrep` cross-check that
     /// records an engine-restart-mid-fsck as `Failed` instead of leaving
@@ -4626,7 +3848,7 @@ impl FilesystemService {
                     entry.last_repair = Some(status.repair);
                     entry.last_outcome = Some(FsckOutcome::Failed);
                     entry.last_output = Some(
-                        "engine restarted while fsck was running — the bcachefs child was lost; \
+                        "engine restarted while fsck was running — the btrfs scrub child was lost; \
                          start the check again."
                             .into(),
                     );
@@ -4645,109 +3867,67 @@ impl FilesystemService {
 
     /// Get reconcile (background work) status for a filesystem.
     /// `bcachefs reconcile status <mountpoint>`
-    pub async fn reconcile_status(&self, name: &str) -> Result<ReconcileStatus, FilesystemError> {
-        let fs = self.get(name).await?;
-        if !fs.mounted {
-            return Err(FilesystemError::CommandFailed(
-                "filesystem must be mounted to check reconcile status".to_string(),
-            ));
-        }
-        let mount_point = fs.mount_point.as_ref().unwrap();
-
-        let raw = cmd::run_ok("bcachefs", &["reconcile", "status", mount_point])
-            .await
-            .unwrap_or_else(|_| "No reconcile data available".to_string());
-
-        let enabled = self.reconcile_enabled(&fs.uuid).await;
-
-        Ok(ReconcileStatus { raw, enabled })
+    pub async fn reconcile_status(&self, _name: &str) -> Result<ReconcileStatus, FilesystemError> {
+        Err(FilesystemError::InvalidInput(
+            "reconcile is not supported on btrfs builds".into(),
+        ))
     }
+
 
     /// Read reconcile_enabled from sysfs for a mounted filesystem.
-    async fn reconcile_enabled(&self, uuid: &str) -> bool {
-        let path = format!("/sys/fs/bcachefs/{uuid}/options/reconcile_enabled");
-        tokio::fs::read_to_string(&path)
-            .await
-            .map(|s| s.trim() != "0")
-            .unwrap_or(true)
+    async fn reconcile_enabled(&self, _uuid: &str) -> bool {
+        false
     }
+
 
     /// Enable or disable reconcile on a mounted filesystem via sysfs.
     pub async fn set_reconcile_enabled(
         &self,
-        name: &str,
-        enabled: bool,
+        _name: &str,
+        _enabled: bool,
     ) -> Result<(), FilesystemError> {
-        let fs = self.get(name).await?;
-        if !fs.mounted {
-            return Err(FilesystemError::CommandFailed(
-                "filesystem must be mounted to toggle reconcile".to_string(),
-            ));
-        }
-        let path = format!("/sys/fs/bcachefs/{}/options/reconcile_enabled", fs.uuid);
-        let val = if enabled { "1" } else { "0" };
-        info!("Setting reconcile_enabled={val} on filesystem '{name}'");
-        tokio::fs::write(&path, val)
-            .await
-            .map_err(|e| FilesystemError::CommandFailed(format!("failed to write {path}: {e}")))
+        Err(FilesystemError::InvalidInput(
+            "reconcile is not supported on btrfs builds".into(),
+        ))
     }
+
 
     /// Whether copygc (copy garbage collection) is enabled for a mounted
     /// filesystem. `None` when the kernel doesn't expose the option, so
     /// callers can hide the control rather than guess (forward-compat —
     /// e.g. `rebalance_enabled` was dropped upstream in favour of
     /// `reconcile_enabled`). (#553)
-    pub async fn copygc_status(&self, name: &str) -> Result<Option<bool>, FilesystemError> {
-        let fs = self.get(name).await?;
-        if !fs.mounted {
-            return Ok(None);
-        }
-        let path = format!("/sys/fs/bcachefs/{}/options/copygc_enabled", fs.uuid);
-        Ok(match tokio::fs::read_to_string(&path).await {
-            Ok(s) => Some(s.trim() != "0"),
-            Err(_) => None,
-        })
+    pub async fn copygc_status(&self, _name: &str) -> Result<Option<bool>, FilesystemError> {
+        Ok(None)
     }
+
 
     /// Enable or disable copygc on a mounted filesystem via sysfs.
     /// Pausing copygc (`enabled=false`) is the same lever nasty-top's
     /// advisor pulls on write-stalls. (#553)
     pub async fn set_copygc_enabled(
         &self,
-        name: &str,
-        enabled: bool,
+        _name: &str,
+        _enabled: bool,
     ) -> Result<(), FilesystemError> {
-        let fs = self.get(name).await?;
-        if !fs.mounted {
-            return Err(FilesystemError::CommandFailed(
-                "filesystem must be mounted to toggle copygc".to_string(),
-            ));
-        }
-        let path = format!("/sys/fs/bcachefs/{}/options/copygc_enabled", fs.uuid);
-        let val = if enabled { "1" } else { "0" };
-        info!("Setting copygc_enabled={val} on filesystem '{name}'");
-        tokio::fs::write(&path, val)
-            .await
-            .map_err(|e| FilesystemError::CommandFailed(format!("failed to write {path}: {e}")))
+        Err(FilesystemError::InvalidInput(
+            "copygc is not supported on btrfs builds".into(),
+        ))
     }
+
 
     /// Active data-move operations from `internal/moving_ctxts` — live
     /// progress for scrub / reconcile / copygc / evacuate (#540). Empty on
     /// an unmounted fs or when the debug file is absent/unreadable.
-    pub async fn moving_ctxts(&self, name: &str) -> Vec<MoveCtx> {
-        let Ok(fs) = self.get(name).await else {
-            return Vec::new();
-        };
-        if !fs.mounted {
-            return Vec::new();
-        }
-        let path = format!("/sys/fs/bcachefs/{}/internal/moving_ctxts", fs.uuid);
-        let raw = tokio::fs::read_to_string(&path).await.unwrap_or_default();
-        parse_moving_ctxts(&raw)
+    pub async fn moving_ctxts(&self, _name: &str) -> Vec<MoveCtx> {
+        // bcachefs moving_ctxts sysfs is not available on btrfs.
+        Vec::new()
     }
+
 
     /// Raw output of `bcachefs fs usage <mount>` — space breakdown by data type and device.
     pub async fn bcachefs_usage(&self, name: &str) -> Result<String, FilesystemError> {
+        // Thin wrapper: return btrfs filesystem usage text under the legacy RPC name.
         let fs = self.get(name).await?;
         if !fs.mounted {
             return Err(FilesystemError::CommandFailed(
@@ -4755,72 +3935,28 @@ impl FilesystemService {
             ));
         }
         let mount_point = fs.mount_point.as_ref().unwrap();
-        let raw = cmd::run_ok("bcachefs", &["fs", "usage", "-a", "-h", mount_point])
+        cmd::run_ok("btrfs", &["filesystem", "usage", "-h", mount_point])
             .await
-            .map_err(FilesystemError::CommandFailed)?;
-        Ok(raw)
+            .map_err(FilesystemError::CommandFailed)
     }
 
-    pub async fn bcachefs_top(&self, name: &str) -> Result<String, FilesystemError> {
-        let fs = self.get(name).await?;
-        if !fs.mounted {
-            return Err(FilesystemError::CommandFailed(
-                "filesystem must be mounted".to_string(),
-            ));
-        }
-        let mount_point = fs.mount_point.as_ref().unwrap();
-        // Use `script` to provide a PTY so fs top doesn't fail with "No such device"
-        // Capture 2 seconds of output to get at least one full frame
-        let raw = cmd::run_ok(
-            "script",
-            &[
-                "-qc",
-                &format!("timeout 2 bcachefs fs top -h {mount_point}"),
-                "/dev/null",
-            ],
-        )
-        .await
-        .map_err(FilesystemError::CommandFailed)?;
 
-        // Strip ANSI escapes and extract the last complete frame
-        let clean = strip_ansi(&raw);
-        // Split on clear-screen artifacts and take the last substantial frame
-        let clean_ref = clean.as_str();
-        let frames: Vec<&str> = clean_ref.split("\x1b[?1049h").collect();
-        let frame = frames.last().unwrap_or(&clean_ref);
-        // Clean up: remove carriage returns, control chars, and the header/help lines
-        let lines: Vec<&str> = frame
-            .lines()
-            .map(|l| l.trim_end_matches('\r'))
-            .filter(|l| !l.is_empty())
-            .filter(|l| !l.starts_with("All counters"))
-            .filter(|l| !l.starts_with("  perf trace"))
-            .filter(|l| !l.starts_with("  q:quit"))
-            .collect();
-        Ok(lines.join("\n"))
+    pub async fn bcachefs_top(&self, _name: &str) -> Result<String, FilesystemError> {
+        Err(FilesystemError::InvalidInput(
+            "bcachefs.top is not supported on btrfs builds".into(),
+        ))
     }
+
 
     pub async fn bcachefs_timestats(
         &self,
-        name: &str,
+        _name: &str,
     ) -> Result<serde_json::Value, FilesystemError> {
-        let fs = self.get(name).await?;
-        if !fs.mounted {
-            return Err(FilesystemError::CommandFailed(
-                "filesystem must be mounted".to_string(),
-            ));
-        }
-        let mount_point = fs.mount_point.as_ref().unwrap();
-        let raw = cmd::run_ok(
-            "bcachefs",
-            &["fs", "timestats", "--json", "--once", mount_point],
-        )
-        .await
-        .map_err(FilesystemError::CommandFailed)?;
-        serde_json::from_str(&raw).map_err(|e| {
-            FilesystemError::CommandFailed(format!("failed to parse timestats JSON: {e}"))
-        })
+        Err(FilesystemError::InvalidInput(
+            "bcachefs.timestats is not supported on btrfs builds".into(),
+        ))
     }
+
 }
 
 /// Strip ANSI escape sequences (used for bcachefs raw text output).
@@ -5035,6 +4171,14 @@ pub struct BlockDevice {
     pub fs_uuid: Option<String>,
     /// Whether the device is currently in use (mounted, in a filesystem, or has partitions in use).
     pub in_use: bool,
+    /// Kernel holders of this device (e.g. `md256`, `dm-0`). Empty when free.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub holders: Vec<String>,
+    /// Whether `device.wipe` can reclaim this device. False when mounted or a
+    /// managed filesystem member; true when merely held by md/dm (wipe releases
+    /// those holders first).
+    #[serde(default = "default_wipeable")]
+    pub wipeable: bool,
     /// Whether the underlying disk spins (false for NVMe/SSD, true for HDD).
     pub rotational: bool,
     /// Device speed class: "nvme", "ssd", or "hdd".
@@ -5074,6 +4218,198 @@ pub struct BlockDevice {
 
 fn default_type_source() -> String {
     "detected".to_string()
+}
+
+fn default_wipeable() -> bool {
+    true
+}
+
+fn device_kname(path: &str) -> &str {
+    path.trim_start_matches("/dev/")
+}
+
+async fn read_sysfs_holders(path: &str) -> Vec<String> {
+    let holders_dir = format!("/sys/class/block/{}/holders", device_kname(path));
+    let mut holders = Vec::new();
+    let Ok(mut entries) = tokio::fs::read_dir(&holders_dir).await else {
+        return holders;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        holders.push(entry.file_name().to_string_lossy().into_owned());
+    }
+    holders.sort();
+    holders
+}
+
+async fn read_active_swap_paths() -> HashSet<String> {
+    let Ok(content) = tokio::fs::read_to_string("/proc/swaps").await else {
+        return HashSet::new();
+    };
+    content
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let path = line.split_whitespace().next()?;
+            if path.starts_with('/') {
+                Some(path.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+async fn path_is_mounted(path: &str) -> bool {
+    let Ok(content) = tokio::fs::read_to_string("/proc/mounts").await else {
+        return false;
+    };
+    let kname = device_kname(path);
+    content.lines().any(|line| {
+        let Some(source) = line.split_whitespace().next() else {
+            return false;
+        };
+        if source == path || source.ends_with(&format!("/{kname}")) {
+            return true;
+        }
+        // Colon-joined multi-device mounts.
+        source.split(':').any(|part| part == path || part.ends_with(&format!("/{kname}")))
+    })
+}
+
+async fn dm_mapper_name(dm_kname: &str) -> Option<String> {
+    tokio::fs::read_to_string(format!("/sys/class/block/{dm_kname}/dm/name"))
+        .await
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Stop md/dm/swap holders so wipefs can claim a device. Refuses when any
+/// device in the holder chain is mounted (data volumes stay protected).
+async fn release_holders_for_wipe(root_paths: &[String]) -> Result<(), FilesystemError> {
+    async fn holder_closure(roots: &[String]) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut stack: Vec<String> = roots.to_vec();
+        let mut holders = Vec::new();
+        while let Some(path) = stack.pop() {
+            for holder in read_sysfs_holders(&path).await {
+                if seen.insert(holder.clone()) {
+                    holders.push(holder.clone());
+                    stack.push(format!("/dev/{holder}"));
+                }
+            }
+        }
+        holders
+    }
+
+    let holder_names = holder_closure(root_paths).await;
+
+    for path in root_paths
+        .iter()
+        .cloned()
+        .chain(holder_names.iter().map(|h| format!("/dev/{h}")))
+    {
+        if path_is_mounted(&path).await {
+            return Err(FilesystemError::DeviceInUse(format!(
+                "{path} is mounted; unmount it before wiping"
+            )));
+        }
+    }
+
+    if holder_names.is_empty() {
+        return Ok(());
+    }
+
+    info!(
+        "Releasing block holders before wipe: {}",
+        holder_names.join(", ")
+    );
+
+    for _ in 0..32 {
+        let remaining = holder_closure(root_paths).await;
+        if remaining.is_empty() {
+            return Ok(());
+        }
+
+        // Tear down from the top of the stack first (holders with no further
+        // holders), e.g. dm-on-md before the md array itself.
+        let mut tips = Vec::new();
+        for holder in &remaining {
+            let nested = read_sysfs_holders(&format!("/dev/{holder}")).await;
+            if nested.is_empty() {
+                tips.push(holder.clone());
+            }
+        }
+        if tips.is_empty() {
+            tips = remaining.clone();
+        }
+
+        let mut progressed = false;
+        for holder in tips {
+            let holder_path = format!("/dev/{holder}");
+            let swaps = read_active_swap_paths().await;
+            if swaps.contains(&holder_path)
+                || swaps.iter().any(|s| s.ends_with(&format!("/{holder}")))
+            {
+                info!("swapoff {holder_path}");
+                cmd::run_ok("swapoff", &[&holder_path])
+                    .await
+                    .map_err(|e| {
+                        FilesystemError::CommandFailed(format!("swapoff {holder_path}: {e}"))
+                    })?;
+                progressed = true;
+                continue;
+            }
+
+            if holder.starts_with("md") {
+                info!("mdadm --stop {holder_path}");
+                cmd::run_ok("mdadm", &["--stop", &holder_path])
+                    .await
+                    .map_err(|e| {
+                        FilesystemError::CommandFailed(format!("mdadm --stop {holder_path}: {e}"))
+                    })?;
+                progressed = true;
+                continue;
+            }
+
+            if holder.starts_with("dm-") {
+                let mapper = dm_mapper_name(&holder)
+                    .await
+                    .unwrap_or_else(|| holder.clone());
+                let mapper_path = format!("/dev/mapper/{mapper}");
+                info!("deactivating device-mapper {holder} ({mapper_path})");
+                if mapper.contains('-') {
+                    let _ = cmd::run_ok("lvchange", &["-an", &mapper_path]).await;
+                }
+                match cmd::run_ok("dmsetup", &["remove", "--force", &holder]).await {
+                    Ok(_) => {
+                        progressed = true;
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(FilesystemError::CommandFailed(format!(
+                            "failed to remove device-mapper {holder} ({mapper_path}): {e}"
+                        )));
+                    }
+                }
+            }
+
+            return Err(FilesystemError::DeviceInUse(format!(
+                "{holder_path} holds a device selected for wipe and cannot be released automatically"
+            )));
+        }
+
+        if !progressed {
+            return Err(FilesystemError::DeviceInUse(format!(
+                "could not release holders on {}: still held after teardown attempts",
+                root_paths.join(", ")
+            )));
+        }
+    }
+
+    Err(FilesystemError::DeviceInUse(
+        "holder release did not converge; device still in use".into(),
+    ))
 }
 
 /// Get the largest contiguous free space on a partitioned disk using sgdisk.
@@ -5116,245 +4452,30 @@ async fn get_disk_free_space(disk_path: &str) -> Result<u64, String> {
 
 /// Read per-device info (labels, durability) for a mounted bcachefs filesystem.
 /// Uses `bcachefs show-super` on the first device to extract member info.
-async fn read_fs_devices(uuid: &str, device_paths: &[String]) -> Vec<FilesystemDevice> {
-    let first_dev = match device_paths.first() {
-        Some(d) => d.as_str(),
-        None => return Vec::new(),
-    };
-
-    let member_info = cmd::run_ok("bcachefs", &["show-super", "-f", "members_v2", first_dev])
-        .await
-        .unwrap_or_default();
-
-    // The authoritative member set for a mounted pool (incl. missing
-    // members — phantom dev-N with no block device). Empty when unmounted.
-    let sysfs_members = read_device_sysfs(uuid).await;
-    let sysfs_by_path: HashMap<&str, &DeviceSysfs> = sysfs_members
+async fn read_fs_devices(_uuid: &str, device_paths: &[String]) -> Vec<FilesystemDevice> {
+    // First-cut: report member paths without bcachefs show-super/sysfs enrichment.
+    device_paths
         .iter()
-        .filter_map(|m| m.path.as_deref().map(|p| (p, m)))
-        .collect();
-
-    // show-super -f members_v2 output comes in two formats:
-    //
-    // Single-line (older):
-    //   Device 0 (label ssd.fast):  /dev/sda  ...  durability: 1  state: rw
-    //
-    // Multi-line (newer):
-    //   Device 0:       /dev/sda
-    //           Label:          ssd.fast
-    //           State:          rw
-    //           Durability:     1
-    //
-    // Split output into per-device blocks by "Device N:" markers, then scan
-    // each block for the info we need regardless of which format is used.
-
-    // Build blocks: each block is all lines from one "Device N:" until the next.
-    let lines: Vec<&str> = member_info.lines().collect();
-    let mut blocks: Vec<Vec<&str>> = Vec::new();
-    let mut current: Vec<&str> = Vec::new();
-    for line in &lines {
-        let trimmed = line.trim();
-        // A new device block starts when a line begins with "Device " followed by a digit.
-        if trimmed.starts_with("Device ")
-            && trimmed.chars().nth(7).is_some_and(|c| c.is_ascii_digit())
-            && !current.is_empty()
-        {
-            blocks.push(current.clone());
-            current.clear();
-        }
-        current.push(line);
-    }
-    if !current.is_empty() {
-        blocks.push(current);
-    }
-
-    let extract_value = |block: &[&str], key: &str| -> Option<String> {
-        for line in block {
-            let lower = line.to_lowercase();
-            if let Some(pos) = lower.find(key) {
-                let rest = &line[pos + key.len()..];
-                let rest = rest.trim_start_matches([':', ' ', '\t']);
-                // Take first token, strip surrounding punctuation
-                if let Some(tok) = rest.split_whitespace().next() {
-                    let tok =
-                        tok.trim_matches(|c: char| c == '(' || c == ')' || c == ',' || c == ';');
-                    if !tok.is_empty() && tok != "none" {
-                        return Some(tok.to_string());
-                    }
-                }
-            }
-        }
-        None
-    };
-
-    // bcachefs's own `Rotational` flag per member slot, from the
-    // superblock (#501). Keyed by member index, not device path, so it
-    // stays correct across a remove/re-add reshuffle and means the same
-    // persisted thing whether or not the pool is mounted — and so the
-    // value is consistent with the sysfs-vs-show-super divergence the
-    // latch bug (#594) can cause: we always report the persisted
-    // superblock value here.
-    let rotational_by_slot: std::collections::HashMap<u32, bool> = blocks
-        .iter()
-        .filter_map(|b| {
-            let idx = b.first().and_then(|h| parse_device_index(h))?;
-            let rot = extract_value(b, "rotational")?;
-            Some((idx, rot == "1" || rot == "true"))
-        })
-        .collect();
-    let rotational_of = |slot: Option<u32>| slot.and_then(|i| rotational_by_slot.get(&i).copied());
-
-    let mut devices: Vec<FilesystemDevice> = Vec::new();
-    // Phantom slots already represented by a bound /proc/mounts row,
-    // skipped by the missing-member loop below.
-    let mut bound_slots: std::collections::HashSet<Option<u32>> = std::collections::HashSet::new();
-
-    for dev_path in device_paths {
-        // Mounted pool: sysfs is the authoritative, correctly-mapped
-        // source. It's keyed by the kernel's live `block` symlink, so it
-        // stays correct after a remove/re-add reshuffle, and it doesn't
-        // need the passphrase on encrypted pools. show-super, by contrast,
-        // reports the device PATHS stored in the superblock — which go
-        // stale on reshuffle and made labels/slots land on the wrong row
-        // (#455). So prefer sysfs; only fall back to show-super when the
-        // filesystem isn't mounted (no sysfs tree).
-        if let Some(sy) = sysfs_by_path.get(dev_path.as_str()) {
-            devices.push(FilesystemDevice {
-                path: dev_path.clone(),
-                label: sy.label.clone(),
-                durability: sy.durability,
-                state: sy.state.clone(),
-                data_allowed: sy.data_allowed.clone(),
-                has_data: sy.has_data.clone(),
-                discard: sy.discard,
-                rotational: rotational_of(sy.member_index),
-                read_errors: sy.read_errors,
-                write_errors: sy.write_errors,
-                checksum_errors: sy.checksum_errors,
-                member_index: sy.member_index,
-                uuid: sy.uuid.clone(),
-                missing: None,
-            });
-            continue;
-        }
-
-        // Unmounted: fall back to show-super's per-device blocks, matched
-        // by device path (best-effort; sysfs is absent here).
-        let dev_short = dev_path.trim_start_matches("/dev/");
-        let block = blocks.iter().find(|b| {
-            b.iter()
-                .any(|l| l.contains(dev_path.as_str()) || l.contains(dev_short))
-        });
-        let (label, durability, state, data_allowed, has_data, discard) = if let Some(block) = block
-        {
-            let label = extract_value(block, "label");
-            let durability = extract_value(block, "durability").and_then(|s| s.parse().ok());
-            let state = extract_value(block, "state");
-            let data_allowed = extract_value(block, "data allowed");
-            let has_data = extract_value(block, "has data");
-            let discard = extract_value(block, "discard").map(|s| s == "1" || s == "true");
-            (label, durability, state, data_allowed, has_data, discard)
-        } else {
-            (None, None, None, None, None, None)
-        };
-        let member_index = block
-            .and_then(|b| b.first())
-            .and_then(|hdr| parse_device_index(hdr));
-
-        // On a mounted pool every *attached* member is in sysfs_by_path,
-        // so reaching here with a non-empty sysfs tree means this
-        // /proc/mounts path dropped out after mount. Its slot lives on as
-        // a phantom dev-N — bind the two into one row carrying the real
-        // path (so the re-attach affordance has a device to act on) and
-        // the phantom's live sysfs fields, flagged missing, instead of a
-        // stale-`rw` superblock row plus a separate "(missing dev-N)"
-        // placeholder for the same member (#472).
-        if !sysfs_members.is_empty() {
-            let phantom = member_index.and_then(|idx| {
-                sysfs_members
-                    .iter()
-                    .find(|m| m.path.is_none() && m.member_index == Some(idx))
-            });
-            if let Some(m) = phantom {
-                bound_slots.insert(m.member_index);
-                devices.push(FilesystemDevice {
-                    path: dev_path.clone(),
-                    label: m.label.clone(),
-                    durability: m.durability,
-                    state: m.state.clone(),
-                    data_allowed: m.data_allowed.clone(),
-                    has_data: m.has_data.clone(),
-                    discard: m.discard,
-                    rotational: rotational_of(m.member_index),
-                    read_errors: m.read_errors,
-                    write_errors: m.write_errors,
-                    checksum_errors: m.checksum_errors,
-                    member_index: m.member_index,
-                    uuid: m.uuid.clone(),
-                    missing: Some(true),
-                });
-                continue;
-            }
-        }
-
-        devices.push(FilesystemDevice {
-            path: dev_path.clone(),
-            label,
-            durability,
-            state,
-            data_allowed,
-            has_data,
-            discard,
-            rotational: rotational_of(member_index),
+        .enumerate()
+        .map(|(idx, path)| FilesystemDevice {
+            path: path.clone(),
+            label: None,
+            durability: None,
+            state: Some("rw".to_string()),
+            data_allowed: None,
+            has_data: None,
+            discard: None,
+            rotational: None,
             read_errors: None,
             write_errors: None,
             checksum_errors: None,
-            member_index,
+            member_index: Some(idx as u32),
             uuid: None,
-            // No phantom slot matched, but on a mounted pool this device
-            // is still detached — don't pretend it's a healthy member.
-            missing: if sysfs_members.is_empty() {
-                None
-            } else {
-                Some(true)
-            },
-        });
-    }
-
-    // Missing members (#466): superblock still lists them but their block
-    // device is gone (pulled/dead) — surfaced as phantom dev-N in sysfs
-    // with no resolvable `block` symlink. They're not in `device_paths`
-    // (which comes from /proc/mounts = present devices), so add them here
-    // so the operator can see the dead member and force-remove it.
-    for m in &sysfs_members {
-        if m.path.is_some() || bound_slots.contains(&m.member_index) {
-            continue;
-        }
-        let slot = m
-            .member_index
-            .map(|i| i.to_string())
-            .unwrap_or_else(|| "?".to_string());
-        devices.push(FilesystemDevice {
-            // Synthetic, stable per-slot key (the row has no real /dev node).
-            path: format!("(missing dev-{slot})"),
-            label: m.label.clone(),
-            durability: m.durability,
-            state: m.state.clone(),
-            data_allowed: m.data_allowed.clone(),
-            has_data: m.has_data.clone(),
-            discard: m.discard,
-            rotational: rotational_of(m.member_index),
-            read_errors: m.read_errors,
-            write_errors: m.write_errors,
-            checksum_errors: m.checksum_errors,
-            member_index: m.member_index,
-            uuid: m.uuid.clone(),
-            missing: Some(true),
-        });
-    }
-
-    devices
+            missing: None,
+        })
+        .collect()
 }
+
 
 /// Parse `/sys/fs/bcachefs/<uuid>/dev-N/io_errors`, returning the
 /// cumulative `(read, write, checksum)` counts from the "since
@@ -5522,123 +4643,23 @@ fn parse_bcachefs_opt(val: &str) -> String {
     }
 }
 
-async fn read_fs_options_sysfs(uuid: &str) -> FilesystemOptions {
-    if uuid.is_empty() {
-        return FilesystemOptions::default();
-    }
-
-    let base = format!("/sys/fs/bcachefs/{uuid}/options");
-
-    async fn read_opt(base: &str, name: &str) -> Option<String> {
-        let path = format!("{base}/{name}");
-        match tokio::fs::read_to_string(&path).await {
-            Ok(s) => {
-                let v = parse_bcachefs_opt(s.trim());
-                if v.is_empty() || v == "none" || v == "(none)" {
-                    None
-                } else {
-                    Some(v)
-                }
-            }
-            Err(_) => None,
-        }
-    }
-
-    async fn read_opt_u32(base: &str, name: &str) -> Option<u32> {
-        read_opt(base, name).await.and_then(|s| s.parse().ok())
-    }
-
-    async fn read_opt_bool(base: &str, name: &str) -> Option<bool> {
-        read_opt(base, name).await.map(|s| s == "1" || s == "true")
-    }
-
-    FilesystemOptions {
-        compression: read_opt(&base, "compression").await,
-        background_compression: read_opt(&base, "background_compression").await,
-        data_replicas: read_opt_u32(&base, "data_replicas").await,
-        metadata_replicas: read_opt_u32(&base, "metadata_replicas").await,
-        data_checksum: read_opt(&base, "data_checksum").await,
-        metadata_checksum: read_opt(&base, "metadata_checksum").await,
-        foreground_target: read_opt(&base, "foreground_target").await,
-        background_target: read_opt(&base, "background_target").await,
-        promote_target: read_opt(&base, "promote_target").await,
-        metadata_target: read_opt(&base, "metadata_target").await,
-        erasure_code: read_opt_bool(&base, "erasure_code").await,
-        encrypted: read_opt_bool(&base, "encrypted").await,
-        error_action: read_opt(&base, "errors").await,
-        version_upgrade: read_opt(&base, "version_upgrade").await,
-        locked: None,
-        key_stored: None,
-        degraded: None,
-        verbose: None,
-        fsck: None,
-        journal_flush_disabled: None,
-        journal_flush_delay: read_opt_u32(&base, "journal_flush_delay").await,
-        move_ios_in_flight: read_opt_u32(&base, "move_ios_in_flight").await,
-        move_bytes_in_flight: read_opt(&base, "move_bytes_in_flight").await,
-    }
+async fn read_fs_options_sysfs(_uuid: &str) -> FilesystemOptions {
+    FilesystemOptions::default()
 }
+
 
 /// Read filesystem options from `bcachefs show-super` for an unmounted filesystem.
-async fn read_fs_options_show_super(device: Option<&str>) -> FilesystemOptions {
-    let dev = match device {
-        Some(d) => d,
-        None => return FilesystemOptions::default(),
-    };
-
-    let output = match cmd::run_ok("bcachefs", &["show-super", dev]).await {
-        Ok(o) => o,
-        Err(e) => {
-            // `show-super` failure means the WebUI's "Options" panel
-            // for this filesystem will display all defaults — masking
-            // whatever the real on-disk options are. Worth logging
-            // so the operator can correlate the missing data with a
-            // bcachefs tools / permission issue.
-            warn!("bcachefs show-super {dev} failed: {e}; reporting defaults");
-            return FilesystemOptions::default();
-        }
-    };
-
-    let mut opts = FilesystemOptions::default();
-
-    for line in output.lines() {
-        let line = line.trim();
-        // show-super outputs lines like "Option:  value" or "Option          value"
-        if let Some((key, val)) = line.split_once(':') {
-            let key = key.trim().to_lowercase();
-            let val = parse_bcachefs_opt(val.trim());
-            if val.is_empty() || val == "none" || val == "(none)" {
-                continue;
-            }
-            match key.as_str() {
-                "compression" => opts.compression = Some(val),
-                "background_compression" => opts.background_compression = Some(val),
-                "data_replicas" => opts.data_replicas = val.parse().ok(),
-                "metadata_replicas" => opts.metadata_replicas = val.parse().ok(),
-                "data_checksum" => opts.data_checksum = Some(val),
-                "metadata_checksum" => opts.metadata_checksum = Some(val),
-                "foreground_target" => opts.foreground_target = Some(val),
-                "background_target" => opts.background_target = Some(val),
-                "promote_target" => opts.promote_target = Some(val),
-                "metadata_target" => opts.metadata_target = Some(val),
-                "erasure_code" => opts.erasure_code = Some(val == "1" || val == "true"),
-                "encrypted" => opts.encrypted = Some(val == "1" || val == "true" || val == "yes"),
-                "errors" => opts.error_action = Some(val),
-                "version_upgrade" => opts.version_upgrade = Some(val),
-                _ => {}
-            }
-        }
-    }
-
-    opts
+async fn read_fs_options_show_super(_device: Option<&str>) -> FilesystemOptions {
+    FilesystemOptions::default()
 }
+
 
 /// One row pulled from `/proc/mounts` for a bcachefs filesystem.
 /// `devices` is the colon-separated source split into individual
 /// device paths (`/dev/sda:/dev/sdb` → `["/dev/sda", "/dev/sdb"]`),
 /// since multi-device bcachefs filesystems are first-class.
 #[derive(Debug, PartialEq, Eq)]
-struct ProcMountsBcachefs {
+struct ProcMountsBtrfs {
     devices: Vec<String>,
     mount_point: String,
 }
@@ -5648,15 +4669,15 @@ struct ProcMountsBcachefs {
 /// fixed (man proc(5): `device mount_point fstype options dump pass`),
 /// so this stays simple — but naming the fields keeps the call site
 /// readable and gives us a test seam for any future regression.
-fn parse_bcachefs_mount_line(line: &str) -> Option<ProcMountsBcachefs> {
+fn parse_btrfs_mount_line(line: &str) -> Option<ProcMountsBtrfs> {
     let mut fields = line.split_whitespace();
     let device = fields.next()?;
     let mount_point = fields.next()?;
     let fstype = fields.next()?;
-    if fstype != "bcachefs" {
+    if fstype != "btrfs" {
         return None;
     }
-    Some(ProcMountsBcachefs {
+    Some(ProcMountsBtrfs {
         devices: device.split(':').map(String::from).collect(),
         mount_point: mount_point.to_string(),
     })
@@ -5719,28 +4740,57 @@ fn resolve_mount_devices(devices: Vec<String>, sysfs_base: &std::path::Path) -> 
 }
 
 /// Where the kernel exposes mounted bcachefs filesystems.
-const SYSFS_BCACHEFS: &str = "/sys/fs/bcachefs";
+const SYSFS_BTRFS: &str = "/sys/fs/btrfs";
 
-/// Parse /proc/mounts for bcachefs entries.
+/// Parse /proc/mounts for btrfs entries.
 /// Returns map of mount_point -> list of devices.
-async fn read_bcachefs_mounts() -> Result<HashMap<String, Vec<String>>, FilesystemError> {
+async fn read_btrfs_mounts() -> Result<HashMap<String, Vec<String>>, FilesystemError> {
     let content = tokio::fs::read_to_string("/proc/mounts")
         .await
         .unwrap_or_default();
-    let mounts = content
-        .lines()
-        .filter_map(parse_bcachefs_mount_line)
-        .map(|m| {
-            (
-                m.mount_point,
-                resolve_mount_devices(m.devices, std::path::Path::new(SYSFS_BCACHEFS)),
-            )
-        })
-        .collect();
+    let mut mounts: HashMap<String, Vec<String>> = HashMap::new();
+    for m in content.lines().filter_map(parse_btrfs_mount_line) {
+        let uuid = match by_uuid_source(&m.devices) {
+            Some(uuid) => Some(uuid.to_string()),
+            None => match m.devices.first() {
+                Some(dev) => get_fs_uuid(dev).await,
+                None => None,
+            },
+        };
+        let devices = if let Some(uuid) = uuid.as_deref() {
+            match expand_btrfs_members(uuid).await {
+                Some(devs) if !devs.is_empty() => devs,
+                _ => m.devices,
+            }
+        } else {
+            m.devices
+        };
+        mounts.insert(m.mount_point, devices);
+    }
     Ok(mounts)
 }
 
-/// Get the bcachefs UUID for a device.
+async fn expand_btrfs_members(uuid: &str) -> Option<Vec<String>> {
+    let output = cmd::run_ok("blkid", &["-t", &format!("UUID={uuid}"), "-o", "device"])
+        .await
+        .ok()?;
+    let mut devices: Vec<String> = output
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    devices.sort();
+    devices.dedup();
+    if devices.is_empty() {
+        None
+    } else {
+        Some(devices)
+    }
+}
+
+
+/// Get the filesystem UUID for a device.
 /// Tries blkid first (works when unmounted), falls back to lsblk (works when mounted).
 /// bcachefs 1.38+ can make blkid fail on mounted devices.
 async fn get_fs_uuid(device: &str) -> Option<String> {
@@ -5800,15 +4850,15 @@ async fn get_mount_usage(mount_point: &str) -> Option<(u64, u64, u64)> {
     }
 }
 
-/// Check if a device already has a bcachefs filesystem
-async fn is_device_bcachefs(device: &str) -> bool {
+/// Check if a device already has a btrfs filesystem
+async fn is_device_btrfs(device: &str) -> bool {
     cmd::run_ok("blkid", &["-s", "TYPE", "-o", "value", device])
         .await
-        .map(|s| s.trim() == "bcachefs")
+        .map(|s| s.trim() == "btrfs")
         .unwrap_or(false)
 }
 
-/// Discover unmounted bcachefs filesystems via blkid.
+/// Discover unmounted btrfs filesystems via blkid.
 /// Returns Vec of (uuid, label, devices) for filesystems not in seen_uuids.
 /// Look up a filesystem name by UUID in the persisted fs-state.json.
 fn find_fs_name_by_uuid(state: &FsState, uuid: &str) -> Option<String> {
@@ -5869,16 +4919,16 @@ fn select_filesystem_for_mount(
     select_filesystem_by_name(filesystems, name)
 }
 
-async fn discover_unmounted_bcachefs(
+async fn discover_unmounted_btrfs(
     seen_uuids: &std::collections::HashSet<String>,
 ) -> Vec<(String, String, Vec<String>)> {
-    let output = match cmd::run_ok("blkid", &["-t", "TYPE=bcachefs", "-o", "export"]).await {
+    let output = match cmd::run_ok("blkid", &["-t", "TYPE=btrfs", "-o", "export"]).await {
         Ok(o) => o,
         Err(e) => {
             // blkid failure means we'll silently miss every unmounted
             // bcachefs filesystem on the box. The WebUI's "import"
             // flow won't see them. Loud log so the operator notices.
-            warn!("blkid failed: {e}; unmounted bcachefs filesystems will not be discovered");
+            warn!("blkid failed: {e}; unmounted btrfs filesystems will not be discovered");
             return Vec::new();
         }
     };
@@ -5897,7 +4947,7 @@ async fn discover_unmounted_bcachefs(
                 devname = val.to_string();
             } else if let Some(val) = line.strip_prefix("UUID=") {
                 uuid = val.to_string();
-            } else if let Some(val) = line.strip_prefix("LABEL_SUB=") {
+            } else if let Some(val) = line.strip_prefix("LABEL=") {
                 label = val.to_string();
             }
         }
@@ -5959,6 +5009,9 @@ struct FsMountOptions {
     journal_flush_disabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     journal_flush_delay: Option<u32>,
+    /// Mount-time compression (btrfs `compress=`), e.g. `zstd` / `lz4`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compression: Option<String>,
     /// Retained only so unresolved scheduler migration data survives an
     /// unrelated filesystem-state rewrite.
     #[serde(
@@ -6790,8 +5843,8 @@ async fn stream_scrub_and_collect(
     store: &ScrubStateMap,
 ) -> (ScrubOutcome, String) {
     use tokio::io::AsyncReadExt;
-    let mut child = match nasty_common::priority::bulk_command("bcachefs")
-        .args(["scrub", mount])
+    let mut child = match nasty_common::priority::bulk_command("btrfs")
+        .args(["scrub", "start", "-Bd", mount])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -6800,7 +5853,7 @@ async fn stream_scrub_and_collect(
         Err(e) => {
             return (
                 ScrubOutcome::Failed,
-                format!("failed to spawn bcachefs scrub: {e}"),
+                format!("failed to spawn btrfs scrub: {e}"),
             );
         }
     };
@@ -7164,27 +6217,20 @@ fn get_fs_mount_options(state: &FsState, name: &str) -> FsMountOptions {
 }
 
 fn build_mount_opts(opts: &FsMountOptions) -> String {
-    let mut parts = vec!["prjquota".to_string()];
-    if let Some(ref vu) = opts.version_upgrade
-        && !vu.is_empty()
-        && vu != "none"
+    let mut parts = Vec::new();
+    if let Some(ref comp) = opts.compression
+        && !comp.is_empty()
+        && comp != "none"
     {
-        parts.push(format!("version_upgrade={vu}"));
+        // Map NASty compression names onto btrfs mount compress=.
+        let compress = match comp.as_str() {
+            "lz4" => "compress=lzo".to_string(), // btrfs has no lz4; closest common choice
+            other => format!("compress={other}"),
+        };
+        parts.push(compress);
     }
     if opts.degraded == Some(true) {
         parts.push("degraded".to_string());
-    }
-    if opts.verbose == Some(true) {
-        parts.push("verbose".to_string());
-    }
-    if opts.fsck == Some(true) {
-        parts.push("fsck".to_string());
-    }
-    if opts.journal_flush_disabled == Some(true) {
-        parts.push("journal_flush_disabled".to_string());
-    }
-    if let Some(delay) = opts.journal_flush_delay {
-        parts.push(format!("journal_flush_delay={delay}"));
     }
     parts.join(",")
 }
@@ -7221,7 +6267,7 @@ fn mountinfo_has_mountpoint(contents: &str, path: &str) -> bool {
 }
 
 async fn mounted_fs_uuid_at(mount_point: &str) -> Result<Option<String>, FilesystemError> {
-    let mounts = read_bcachefs_mounts().await?;
+    let mounts = read_btrfs_mounts().await?;
     let Some(devices) = mounts.get(mount_point) else {
         return Ok(None);
     };
@@ -7673,6 +6719,24 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("md0")
+        );
+
+        // Whole-disk create must surface child md holders (e.g. sda2 → md256)
+        // once mounts are absent — reclaim is via device.wipe, not create.
+        for node in inventory.devices.values_mut() {
+            node.mount_points.clear();
+        }
+        inventory.devices.get_mut(&data_devno).unwrap().holders = vec!["md256".into()];
+        let disk_err = validate_existing_create_target(
+            &inventory,
+            inventory.get_path("/dev/sda").unwrap(),
+            &HashSet::new(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            disk_err.contains("md256"),
+            "whole-disk create should surface child md holders: {disk_err}"
         );
 
         let node = inventory.devices.get_mut(&data_devno).unwrap();
@@ -8146,11 +7210,11 @@ weird_future_op: ...
         assert!(parse_device_table_line("nonsense without colon-paren").is_none());
     }
 
-    // ── parse_bcachefs_mount_line ──────────────────────────────────
+    // ── parse_btrfs_mount_line ──────────────────────────────────
 
     #[test]
     fn parse_bcachefs_mount_single_device() {
-        let m = parse_bcachefs_mount_line("/dev/sda /mnt/tank bcachefs rw,relatime 0 0")
+        let m = parse_btrfs_mount_line("/dev/sda /mnt/tank btrfs rw,relatime 0 0")
             .expect("should parse");
         assert_eq!(m.mount_point, "/mnt/tank");
         assert_eq!(m.devices, vec!["/dev/sda".to_string()]);
@@ -8158,7 +7222,7 @@ weird_future_op: ...
 
     #[test]
     fn parse_bcachefs_mount_multi_device() {
-        let m = parse_bcachefs_mount_line(
+        let m = parse_btrfs_mount_line(
             "/dev/sda:/dev/sdb:/dev/sdc /mnt/pool bcachefs rw,compression=zstd 0 0",
         )
         .expect("should parse");
@@ -8175,15 +7239,15 @@ weird_future_op: ...
 
     #[test]
     fn parse_bcachefs_mount_skips_other_fstypes() {
-        assert!(parse_bcachefs_mount_line("/dev/sda /mnt ext4 rw 0 0").is_none());
-        assert!(parse_bcachefs_mount_line("tmpfs /run tmpfs rw 0 0").is_none());
+        assert!(parse_btrfs_mount_line("/dev/sda /mnt ext4 rw 0 0").is_none());
+        assert!(parse_btrfs_mount_line("tmpfs /run tmpfs rw 0 0").is_none());
     }
 
     #[test]
     fn parse_bcachefs_mount_skips_short_lines() {
-        assert!(parse_bcachefs_mount_line("").is_none());
-        assert!(parse_bcachefs_mount_line("/dev/sda").is_none());
-        assert!(parse_bcachefs_mount_line("/dev/sda /mnt").is_none());
+        assert!(parse_btrfs_mount_line("").is_none());
+        assert!(parse_btrfs_mount_line("/dev/sda").is_none());
+        assert!(parse_btrfs_mount_line("/dev/sda /mnt").is_none());
     }
 
     // ── by-uuid mount source resolution (bcachefs ≥ 1.38.8) ───────

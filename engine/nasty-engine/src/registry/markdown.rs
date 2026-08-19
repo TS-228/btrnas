@@ -46,7 +46,7 @@ pub fn render_markdown(groups: &[(&str, Vec<Method>)]) -> String {
     );
     out.push_str("```json\n{\"event\": \"pool\"}\n```\n");
     out.push_str("Clients should re-fetch the relevant resource when they receive an event. ");
-    out.push_str("Event types: `filesystem`, `subvolume`, `snapshot`, `share.nfs`, `share.smb`, `share.iscsi`, `share.nvmeof`, `protocol`, `settings`, `alert`.\n\n");
+    out.push_str("Event types: `filesystem`, `subvolume`, `snapshot`, `share.nfs`, `share.smb`, `share.ftp`, `share.sftp`, `share.s3`, `share.iscsi`, `share.nvmeof`, `protocol`, `settings`, `alert`.\n\n");
     out.push_str("---\n\n");
 
     out.push_str("## Contents\n\n");

@@ -59,8 +59,7 @@ export interface SystemInfo {
 	bcachefs_version: string;
 	bcachefs_commit: string | null;
 	bcachefs_pinned_ref: string | null;
-	/** bcachefs-tools ref this NASty build ships with; the top-bar chip
-	 * offers to switch the operator's pin to this when they differ. */
+	/** bcachefs-tools ref this NASty build ships with (engine still reports; unused by webui pin UI). */
 	bcachefs_recommended_ref: string | null;
 	bcachefs_is_custom: boolean;
 	timezone: string;
@@ -142,83 +141,13 @@ export interface HardwareSummary {
 	secure_boot: SecureBootStatus;
 }
 
-/** Sourced from `bootctl status` on the engine. All fields degrade
- * to null when the box isn't UEFI, bootctl is missing, or its output
- * lacks the Secure Boot line — those failure modes surface as
- * `enabled: null` with a human-readable `note`, never as a missing
- * field. `unsupported = true` distinguishes "firmware can't do SB"
- * from "firmware can but operator hasn't enabled it", so the WebUI
- * doesn't nudge the operator toward a firmware setting that isn't
- * there. */
+/** Sourced from `bootctl status` on the engine (informational only). */
 export interface SecureBootStatus {
 	enabled: boolean | null;
 	setup_mode: boolean | null;
 	unsupported: boolean | null;
 	measured_uki: boolean | null;
 	note: string | null;
-}
-
-/** Wire shape of `system.secure_boot.enrollment.status`. Drives the
- * highly-experimental SB onboarding wizard on the Hardware page.
- * `phase.kind` is the discriminator; per-variant fields land
- * inline alongside it (serde flattens — `OverlayWritten` ships
- * `{kind: "overlay_written", overlay_at: 12345}`). */
-export type SecureBootEnrollmentPhase =
-	| { kind: 'not_started' }
-	| { kind: 'overlay_written'; overlay_at: number }
-	| { kind: 'post_enrollment'; detected_at: number; stale_tpm_bindings: string[] }
-	| { kind: 'complete'; completed_at: number }
-	| { kind: 'aborted'; aborted_at: number; reason: string };
-
-export interface SecureBootEnrollmentState {
-	phase: SecureBootEnrollmentPhase;
-	initiated_by: string | null;
-	/** Unix seconds when the wizard's Rebuild button last fired.
-	 * `null` until the operator clicks Rebuild for the first time
-	 * in a given ceremony. The Abort dialog uses this to decide
-	 * whether "you'll need to rebuild once more to revert" applies
-	 * (rebuild_triggered_at = number) or "abort is clean, nothing
-	 * was applied" (null). Cleared on each Begin. */
-	rebuild_triggered_at: number | null;
-}
-
-/** Live snapshot of the wizard-driven `nasty-rebuild` unit, queried
- * via systemctl on every status call. The wizard polls this every
- * few seconds while a rebuild is in flight; we don't try to
- * persist it because systemd is the source of truth and survives
- * engine restarts on its own. */
-export interface SecureBootRebuildSnapshot {
-	status: 'not_run' | 'running' | 'succeeded' | 'failed';
-	exit_code: number | null;
-	journal_tail: string[];
-}
-
-/** Combined response from `system.secure_boot.enrollment.status`.
- * `state` carries the persistent enrollment state; `rebuild` is
- * the live systemd-driven progress that the wizard renders next
- * to the per-phase step copy. */
-export interface SecureBootEnrollmentStatusResponse extends SecureBootEnrollmentState {
-	rebuild: SecureBootRebuildSnapshot;
-}
-
-/** Structured checklist returned by `system.secure_boot.readiness`.
- * Drives the Hardware-page panel that shows whether a box is ready
- * for the lanzaboote opt-in. `ready === true` means every check
- * passes and the (PR #2b) "Enable Secure Boot" affordance is
- * available; otherwise `blocker` names the obstacle. Each individual
- * field exposes the underlying signal so the UI can render an
- * itemised checklist with pass/fail/not-applicable per row. */
-export interface SecureBootReadinessReport {
-	ready: boolean;
-	blocker: string | null;
-	uefi_boot: boolean;
-	sb_supported_by_firmware: boolean | null;
-	sb_currently_off: boolean | null;
-	tpm2_available: boolean;
-	esp_free_bytes: number | null;
-	esp_required_bytes: number;
-	wrapper_has_lanzaboote_input: boolean | null;
-	sbctl_keys_already_generated: boolean;
 }
 
 export interface TpmInfo {
@@ -359,6 +288,9 @@ export interface SubvolumeDependents {
 	backup_jobs: string[];
 	nfs_shares: string[];
 	smb_shares: string[];
+	ftp_shares: string[];
+	sftp_shares: string[];
+	s3_shares: string[];
 	iscsi_targets: string[];
 	nvmeof_subsystems: string[];
 	state_errors: string[];
@@ -374,6 +306,9 @@ export interface FsDependents {
 	backup_jobs: string[];
 	nfs_shares: string[];
 	smb_shares: string[];
+	ftp_shares: string[];
+	sftp_shares: string[];
+	s3_shares: string[];
 	iscsi_targets: string[];
 	nvmeof_subsystems: string[];
 	state_errors: string[];
@@ -579,6 +514,10 @@ export interface BlockDevice {
 	 * to tell an offline/former member from a foreign disk (#472). */
 	fs_uuid?: string;
 	in_use: boolean;
+	/** Kernel holders (e.g. md256, dm-0). Present when another block layer owns the device. */
+	holders?: string[];
+	/** False when mounted or a managed filesystem member; true when wipe can reclaim holders. */
+	wipeable?: boolean;
 	rotational: boolean;
 	/** "nvme" | "ssd" | "hdd" */
 	device_class: string;
@@ -691,398 +630,27 @@ export interface SmbGroup {
 	members: string[];
 }
 
-// ── Active Directory ───────────────────────────────────────
-
-/** Wire shape of `domain.status`. */
-export interface DomainStatus {
-	joined: boolean;
-	realm: string | null;
-	workgroup: string | null;
-	idmap_base: number | null;
-	trust_ok: boolean | null;
-	dc_reachable: boolean | null;
-	clock_skew_seconds: number | null;
-}
-
-/** One AD principal from `domain.user.list` / `domain.group.list` — name is `DOMAIN\name`. */
-export interface DomainPrincipal {
-	name: string;
-}
-
-/** Returned by `dc.status` — Active Directory Domain Controller role (this
- * box *hosts* a domain, as opposed to `DomainStatus`'s member mode). */
-export interface DcStatus {
-	hosting: boolean;
-	realm?: string | null;
-	workgroup?: string | null;
-	dns_forwarder?: string | null;
-	/** Whether samba-dc.service is active. Meaningful only when hosting. */
-	service_healthy: boolean;
-}
-
-/** One AD principal from `dc.user.list` / `dc.group.list` / `dc.computer.list`. */
-export interface DcPrincipal {
-	name: string;
-}
-
-export interface IscsiTarget {
-	id: string;
-	iqn: string;
-	alias: string | null;
-	portals: Portal[];
-	luns: Lun[];
-	acls: Acl[];
-	enabled: boolean;
-}
-
-export interface Portal {
-	ip: string;
-	port: number;
-	/** iSER (iSCSI over RDMA) portal. */
-	iser?: boolean;
-}
-
-export interface Lun {
-	lun_id: number;
-	backstore_path: string;
-	backstore_name: string;
-	backstore_type: string;
-	size_bytes: number | null;
-	backing_volume?: BlockVolumeId | null;
-	backing_volume_unresolved?: boolean;
-}
-
-export interface Acl {
-	initiator_iqn: string;
-	userid: string | null;
-	password: string | null;
-}
-
-export interface NvmeofSubsystem {
-	id: string;
-	nqn: string;
-	namespaces: Namespace[];
-	ports: NvmeofPort[];
-	allowed_hosts: string[];
-	allow_any_host: boolean;
-	enabled: boolean;
-}
-
-export interface Namespace {
-	nsid: number;
-	device_path: string;
-	enabled: boolean;
-	backing_volume?: BlockVolumeId | null;
-	backing_volume_unresolved?: boolean;
-}
-
-export interface NvmeofPort {
-	port_id: number;
-	transport: string;
-	addr: string;
-	service_id: string;
-	addr_family: string;
-}
-
-export type UserRole = 'admin' | 'readonly' | 'operator' | 'user';
-
-export interface UserInfo {
-	username: string;
-	role: UserRole;
-	file_principal?: string | null;
-	/** Number of registered WebAuthn credentials. Defaults to 0 for
-	 * compat with engines that pre-date the field. Drives the admin
-	 * "Reset security keys" button visibility on the /users page. */
-	webauthn_credential_count?: number;
-}
-
-export interface ApiTokenInfo {
+export interface RcloneShare {
 	id: string;
 	name: string;
-	role: 'admin' | 'readonly' | 'operator';
-	created_at: number;
-	filesystem: string | null;
-	expires_at: number | null;
-	allowed_ips: string[];
-}
-
-export interface AuthMe {
-	username: string;
-	role: UserRole;
-	file_principal: string | null;
-	scoped: boolean;
-}
-
-export interface PortalFileRoot {
-	id: string;
-	name: string;
-}
-
-export interface PortalFileEntry {
-	name: string;
-	is_dir: boolean;
-	size: number;
-	modified: number;
-}
-
-export interface PortalBrowseResult {
 	path: string;
-	entries: PortalFileEntry[];
+	comment: string | null;
+	read_only: boolean;
+	enabled: boolean;
 }
 
-export interface MyActivityEntry {
-	ts: number;
-	event: string;
-	user: string;
-	ip: string;
-	detail: string;
+export interface RcloneSettings {
+	listen: string;
+	port: number;
+	username: string;
+	password: string;
+	anonymous: boolean;
+	passive_port_min: number;
+	passive_port_max: number;
 }
 
-export interface ApiTokenCreated extends ApiTokenInfo {
-	token: string;
-}
+export type RcloneProto = 'ftp' | 'sftp' | 's3';
 
-export interface SystemStats {
-	cpu: CpuStats;
-	memory: MemoryStats;
-	network: NetIfStats[];
-	disk_io: DiskIoStats[];
-}
-
-export interface DiskIoStats {
-	name: string;
-	read_bytes: number;
-	write_bytes: number;
-	read_ios: number;
-	write_ios: number;
-	io_in_progress: number;
-}
-
-export interface CpuStats {
-	count: number;
-	load_1: number;
-	load_5: number;
-	load_15: number;
-	temp_c: number | null;
-	freq_mhz: number | null;
-	governor: string | null;
-}
-
-export interface MemoryStats {
-	total_bytes: number;
-	used_bytes: number;
-	available_bytes: number;
-	swap_total_bytes: number;
-	swap_used_bytes: number;
-	/** Approximate kernel-reported bcachefs btree-node buffers, not total bcachefs RAM. */
-	bcachefs_btree_cache_bytes: number | null;
-}
-
-export interface NetIfStats {
-	name: string;
-	rx_bytes: number;
-	tx_bytes: number;
-	rx_packets: number;
-	tx_packets: number;
-	speed_mbps: number | null;
-	up: boolean;
-	addresses: string[];
-}
-
-export interface DiskHealth {
-	device: string;
-	/** smartctl transport flag used to reach this drive (`megaraid,0`,
-	 * `sat+megaraid,2`, `areca,3`). `undefined` for drives reachable via
-	 * smartctl's default transport. Together with `device` it uniquely
-	 * identifies a physical drive — multiple drives behind a RAID
-	 * controller share the same path but have distinct transports. */
-	transport?: string;
-	ata_port?: string;
-	controller_pci?: string;
-	controller_name?: string;
-	pcie_link?: PcieLink;
-	model: string;
-	serial: string;
-	firmware: string;
-	capacity_bytes: number;
-	temperature_c: number | null;
-	power_on_hours: number | null;
-	health_passed: boolean;
-	smart_status: string;
-	/** true = spinning HDD, false = SSD, null/undefined = unknown (NVMe
-	 * dumps carry no rotation rate). */
-	rotational?: boolean | null;
-	attributes: SmartAttribute[];
-	nvme?: NvmeHealth;
-	scsi?: ScsiHealth;
-	ata?: AtaHealth;
-}
-
-/** PCIe link state for a storage controller, sourced from
- * `/sys/bus/pci/devices/<bdf>/{current,max}_link_{speed,width}`.
- * When `current_*` is below `max_*` the link has trained down — common
- * causes include PCIe ASPM power saving, broken bifurcation in a U.2
- * backplane, a flaky riser cable, or a slot wired narrower than
- * physically advertised. Speed strings are passed through verbatim
- * from sysfs (e.g. `"8.0 GT/s PCIe"`). */
-export interface PcieLink {
-	current_speed: string;
-	max_speed: string;
-	current_width: number;
-	max_width: number;
-}
-
-/** ATA / SATA summary fields complementing the generic SMART attribute
- * table. Populated only on ATA drives smartctl could query natively. */
-export interface AtaHealth {
-	interface_speed_current?: string;
-	interface_speed_max?: string;
-	/** Endurance consumed as percentage (0 = new, 100 = nominal end of
-	 * life). Mirrors `NvmeHealth.percentage_used`. Sourced from
-	 * smartctl 7.5+'s top-level `endurance_used.current_percent`.
-	 * `undefined` on spinners, very old SSDs without
-	 * Media_Wearout_Indicator, and pre-7.5 smartctl. */
-	endurance_used_percent?: number;
-}
-
-export interface SmartAttribute {
-	id: number;
-	name: string;
-	value: number;
-	worst: number;
-	threshold: number;
-	raw_value: number;
-	failing: boolean;
-}
-
-export interface NvmeHealth {
-	critical_warning: number;
-	available_spare_percent: number;
-	available_spare_threshold_percent: number;
-	percentage_used: number;
-	data_units_read: number;
-	data_units_written: number;
-	host_reads: number;
-	host_writes: number;
-	controller_busy_minutes: number;
-	power_cycles: number;
-	unsafe_shutdowns: number;
-	media_errors: number;
-	num_err_log_entries: number;
-	/** Human-readable status of the most recent error log entry (e.g.
-	 * `"Invalid Field in Command"`). Only smartctl 7.4+ surfaces the
-	 * actual table behind `num_err_log_entries`; older smartctl + drives
-	 * with an empty log report `undefined`. */
-	most_recent_error?: string;
-	warning_temp_minutes: number;
-	critical_comp_minutes: number;
-	temperature_sensors_c: (number | null)[];
-}
-
-/** SCSI / SAS health information. Populated only on SAS / SCSI drives,
- * including SAS drives reached via `-d megaraid,N`. Field names trace
- * back to the SCSI Primary Commands / Block Commands standards so they
- * match what `smartctl -a` prints. */
-export interface ScsiHealth {
-	transport_protocol?: string;
-	scsi_version?: string;
-	/** Rotation rate in RPM. `0` = SSD; typical SAS spinners: 7200,
-	 * 10500/10033, 15000. */
-	rotation_rate?: number;
-	form_factor?: string;
-	logical_unit_id?: string;
-	/** Drive-trip temperature — the controller's hard shutdown threshold. */
-	drive_trip_temp_c?: number;
-	year_of_manufacture?: string;
-	week_of_manufacture?: string;
-	/** Sectors moved to spare blocks since manufacture. Non-zero is
-	 * normal on aging drives; rate of growth matters more than count. */
-	grown_defect_list?: number;
-	power_on_minutes_since_format?: number;
-	start_stop_cycles?: number;
-	start_stop_cycles_designed?: number;
-	load_unload_cycles?: number;
-	load_unload_cycles_designed?: number;
-	read_errors: ScsiErrorCounters;
-	write_errors: ScsiErrorCounters;
-	verify_errors: ScsiErrorCounters;
-	/** Most recent entry from the SCSI Self-Test rolling log. */
-	last_self_test?: ScsiSelfTestEntry;
-	self_test_count: number;
-}
-
-export interface ScsiErrorCounters {
-	corrected_total: number;
-	/** Non-zero values are the failure signal — drive has lost or
-	 * returned bad data. Engine flips `health_passed` to false when
-	 * any I/O type's uncorrected_total > 0. */
-	uncorrected_total: number;
-	gigabytes_processed: number;
-}
-
-export interface ScsiSelfTestEntry {
-	code: string;
-	result: string;
-	passed: boolean;
-	power_on_hours?: number;
-	in_progress: boolean;
-}
-
-export interface FirmwareDevice {
-	name: string;
-	device_id: string;
-	version: string;
-	vendor: string;
-	update_available: boolean;
-	update_version?: string;
-	update_description?: string;
-}
-
-export interface FirmwareUpdateResult {
-	device_name: string;
-	success: boolean;
-	message: string;
-	reboot_required: boolean;
-}
-
-/** Returned by `firmware.constraints`. Today only Secure Boot is
- * tracked — the EFI-capsule shim fwupd uses to apply updates
- * doesn't work under enforcing SB (upstream lanzaboote#591), so
- * the Apply button gates on `sb_blocks_apply` and renders the
- * `sb_blocks_apply_reason` string verbatim in a tooltip / banner
- * (no client-side translation; the engine owns the copy). */
-export interface FirmwareConstraints {
-	sb_blocks_apply: boolean;
-	sb_blocks_apply_reason: string;
-}
-
-export type ReleaseChannel = 'mild' | 'spicy' | 'nasty';
-
-export interface UpdateInfo {
-	current_version: string;
-	latest_version: string | null;
-	update_available: boolean | null;
-	channel: ReleaseChannel;
-	/** "success" | "failed" | null — result of the most recent upgrade-unit run. */
-	last_attempt: string | null;
-	/** Engine-side error message when the latest-version lookup failed (GH unreachable, rate-limited, …). */
-	error: string | null;
-	/** Snapshot of every tracked flake input — populated by both system.update.version and system.update.check. */
-	inputs: VersionInputInfo[] | null;
-}
-
-export interface VersionInputInfo {
-	name: string;
-	url: string;
-	rev: string | null;
-	/**
-	 * Human-meaningful ref string from flake.lock's
-	 * `nodes[<name>].original.ref` — typically a tag like `v1.38.3`
-	 * or a branch name like `main`. Prefer this for display over
-	 * `rev` (which is just a 12-char SHA prefix) when present.
-	 */
-	tag?: string;
-}
 
 // ── Boot status (engine /api/boot_status) ─────────────────────
 //

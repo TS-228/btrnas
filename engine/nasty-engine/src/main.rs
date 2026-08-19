@@ -57,13 +57,6 @@ pub struct AppState {
     pub log_reload: LogReloadHandle,
     pub system: nasty_system::SystemService,
     pub settings: nasty_system::settings::SettingsService,
-    /// Secure Boot enrollment ceremony state (ADR #324). Service
-    /// is stateful — survives engine restarts via a small JSON file
-    /// at /var/lib/nasty/secure-boot-enrollment.json — and auto-
-    /// detects the SB transition on startup (`bootctl status` flips
-    /// from disabled to enabled across a reboot ⇒ phase advances
-    /// to PostEnrollment).
-    pub secure_boot_enrollment: nasty_system::secure_boot_enrollment::SecureBootEnrollmentService,
     pub tuning: nasty_system::tuning::TuningService,
     pub nut: nasty_system::nut::NutService,
     pub alerts: nasty_system::alerts::AlertService,
@@ -81,8 +74,9 @@ pub struct AppState {
     pub nfs: nasty_sharing::NfsService,
     pub guest_shares: guestshare::GuestShareService,
     pub smb: nasty_sharing::SmbService,
-    pub domain: nasty_system::domain::DomainService,
-    pub dc: nasty_system::dc::DcService,
+    pub ftp: nasty_sharing::RcloneService,
+    pub sftp: nasty_sharing::RcloneService,
+    pub s3: nasty_sharing::RcloneService,
     pub iscsi: nasty_sharing::IscsiService,
     pub nvmeof: Arc<nasty_sharing::NvmeofService>,
     pub vms: nasty_vm::VmService,
@@ -123,14 +117,6 @@ async fn main() -> anyhow::Result<()> {
             Some(commit) => println!("nasty-engine {version} ({commit}, built: {built})"),
             None => println!("nasty-engine {version} (built: {built})"),
         }
-        return Ok(());
-    }
-
-    if matches!(
-        args.get(1).map(String::as_str),
-        Some("bootstrap-system-flake")
-    ) {
-        run_bootstrap_system_flake_cli(&args[2..]).await?;
         return Ok(());
     }
 
@@ -211,8 +197,6 @@ async fn main() -> anyhow::Result<()> {
         log_reload: reload_handle,
         system: nasty_system::SystemService::new(None, Some(built.to_string())),
         settings: settings_service,
-        secure_boot_enrollment:
-            nasty_system::secure_boot_enrollment::SecureBootEnrollmentService::new().await,
         tuning: nasty_system::tuning::TuningService::new().await,
         nut: nasty_system::nut::NutService::new().await,
         alerts: nasty_system::alerts::AlertService::new().await,
@@ -229,8 +213,9 @@ async fn main() -> anyhow::Result<()> {
         nfs: nasty_sharing::NfsService::new(),
         guest_shares: guestshare::GuestShareService::new(),
         smb: nasty_sharing::SmbService::new(),
-        domain: nasty_system::domain::DomainService::new(),
-        dc: nasty_system::dc::DcService::new(),
+        ftp: nasty_sharing::RcloneService::ftp(),
+        sftp: nasty_sharing::RcloneService::sftp(),
+        s3: nasty_sharing::RcloneService::s3(),
         iscsi: nasty_sharing::IscsiService::new(),
         nvmeof,
         vms: nasty_vm::VmService::new(),
@@ -258,10 +243,9 @@ async fn main() -> anyhow::Result<()> {
             "network.restore_pending_revert",
             "network.reconcile_orphans",
             "firewall.init",
+            "rclone.scaffold_config",
             "protocols.restore",
             "smb.scaffold_config",
-            "domain.restore",
-            "dc.restore",
             "nvmeof.restore",
             "vms.restore",
             "apps.restore",
@@ -428,7 +412,6 @@ async fn main() -> anyhow::Result<()> {
                         proto_states.push((*proto, state.protocols.is_enabled(*proto).await));
                     }
                     let rdma_enabled = nasty_system::rdma::enabled().await;
-                    let dc_enabled = nasty_system::dc::DcService::load_config().await.is_some();
                     let (iscsi_ports, nvmeof_ports) =
                         router::share::portal_firewall_ports(&state).await?;
                     let published = router::apps::published_firewall_ports(&state).await?;
@@ -437,7 +420,7 @@ async fn main() -> anyhow::Result<()> {
                         .init(
                             &proto_states,
                             rdma_enabled,
-                            dc_enabled,
+                            false, // AD DC role removed (ksmbd fork)
                             iscsi_ports,
                             nvmeof_ports,
                             published,
@@ -458,9 +441,27 @@ async fn main() -> anyhow::Result<()> {
 
     state
         .boot_status
+        .run_phase("rclone.scaffold_config", secs(20), {
+            let state = state.clone();
+            async move {
+                for (name, svc) in [
+                    ("FTP", &state.ftp),
+                    ("SFTP", &state.sftp),
+                    ("S3", &state.s3),
+                ] {
+                    if let Err(e) = svc.ensure_config().await {
+                        tracing::warn!("Failed to scaffold {name} rclone config: {e}");
+                    }
+                }
+            }
+        })
+        .await;
+
+    state
+        .boot_status
         .run_phase(
             "protocols.restore",
-            secs(90), // 9 systemd services × up to ~10s each on a bursty box
+            secs(90), // systemd services × up to ~10s each on a bursty box
             state.protocols.restore_excluding(&excluded_protocols),
         )
         .await;
@@ -481,14 +482,21 @@ async fn main() -> anyhow::Result<()> {
             .set_protocol_states(&actual_states)
             .await
             .map_err(|e| anyhow::anyhow!("firewall protocol reconciliation failed: {e}"))?;
+        for proto in [Protocol::Ftp, Protocol::Sftp, Protocol::S3] {
+            if !excluded_protocols.contains(&proto) && state.protocols.is_enabled(proto).await {
+                if let Err(e) =
+                    crate::router::share::sync_rclone_firewall_ports(&state, proto).await
+                {
+                    tracing::warn!(
+                        "{} firewall port sync after restore failed: {e}",
+                        proto.display_name()
+                    );
+                }
+            }
+        }
     }
 
-    // Rebuild the smb.nasty.conf include chain before anything AD-related
-    // runs. tmpfiles ships that file empty and only a share mutation ever
-    // rewrote it, so fresh and upgraded boxes carried no
-    // `include = /etc/samba/nasty-domain.conf` — the domain join below (and
-    // winbindd) would see no ADS globals. The rebuild is idempotent, so this
-    // is safe on every boot; it must run BEFORE domain.restore.
+    // Rebuild ksmbd.conf from persisted shares before protocol restore.
     state
         .boot_status
         .run_phase("smb.scaffold_config", secs(15), {
@@ -496,46 +504,17 @@ async fn main() -> anyhow::Result<()> {
             async move {
                 match state.smb.ensure_config_scaffolding().await {
                     Ok(()) => {
-                        tracing::info!("Rebuilt /etc/samba/smb.nasty.conf include chain at boot");
+                        tracing::info!("Rebuilt /etc/ksmbd/ksmbd.conf at boot");
                     }
                     Err(e) => {
-                        tracing::warn!("Failed to rebuild smb.nasty.conf include chain: {e}");
+                        tracing::warn!("Failed to rebuild ksmbd.conf: {e}");
                     }
                 }
             }
         })
         .await;
 
-    // If we're joined to an Active Directory domain, make sure winbindd is
-    // running — `domain.join` already starts it, but a plain reboot doesn't
-    // go through that path.
-    state
-        .boot_status
-        .run_phase("domain.restore", secs(15), {
-            let state = state.clone();
-            async move {
-                if state.domain.is_joined().await {
-                    state.domain.ensure_winbindd().await;
-                }
-            }
-        })
-        .await;
-
-    // If this box hosts an AD domain, bring the DC back up: rewrite the
-    // /run resolved drop-in (tmpfs — empty after reboot) and start
-    // samba-dc (Conflicts= swaps member-mode samba out). Must run after
-    // the smb.nasty.conf reconcile above — the DC config includes it.
-    // The DC firewall was installed before service restoration above, so the
-    // listener never starts ahead of its rule.
-    state
-        .boot_status
-        .run_phase("dc.restore", secs(30), {
-            let state = state.clone();
-            async move {
-                state.dc.ensure_running().await;
-            }
-        })
-        .await;
+    // AD member / DC restore skipped — ksmbd fork has no Samba/winbind.
 
     // SSH password auth is managed via /var/lib/nasty/sshd_override.conf
     // (created by tmpfiles with default "yes", toggled by the WebUI).
@@ -872,7 +851,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/auth/oidc/callback", get(oidc_callback_handler))
         .route(
             "/api/upload/vm-image",
-            post(upload_vm_image_handler).layer(DefaultBodyLimit::max(10_737_418_240)),
+            post(upload_vm_image_handler).layer(DefaultBodyLimit::max(
+                10_737_418_240u64.min(usize::MAX as u64) as usize,
+            )),
         )
         .route("/api/files/browse", get(files_browse_handler))
         .route("/api/user/files/roots", get(user_files::roots_handler))
@@ -885,7 +866,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/files", delete(files_delete_handler))
         .route(
             "/api/files/upload",
-            post(files_upload_handler).layer(DefaultBodyLimit::max(10_737_418_240)),
+            post(files_upload_handler).layer(DefaultBodyLimit::max(
+                10_737_418_240u64.min(usize::MAX as u64) as usize,
+            )),
         )
         .route("/api/files/mkdir", post(files_mkdir_handler))
         .route("/api/files/rename", post(files_rename_handler))
@@ -1167,42 +1150,6 @@ pub(crate) async fn remove_macvlan_shim(state: &AppState, net_name: &str) -> Res
         )
         .await
         .map(|_| ())
-}
-
-async fn run_bootstrap_system_flake_cli(args: &[String]) -> anyhow::Result<()> {
-    if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!(
-            "Usage: nasty-engine bootstrap-system-flake --dest-dir <dir> --template-file <path> --system <system>"
-        );
-        return Ok(());
-    }
-
-    let dest_dir = required_flag_value(args, "--dest-dir")?;
-    let template_file = required_flag_value(args, "--template-file")?;
-    let local_system = required_flag_value(args, "--system")?;
-    let nasty_version = env!("CARGO_PKG_VERSION");
-
-    let result = nasty_system::update::bootstrap_system_flake_from_template_path(
-        &template_file,
-        &dest_dir,
-        nasty_version,
-        &local_system,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-
-    println!("{}", result.flake_path);
-    Ok(())
-}
-
-fn required_flag_value(args: &[String], flag: &str) -> anyhow::Result<String> {
-    let idx = args
-        .iter()
-        .position(|arg| arg == flag)
-        .ok_or_else(|| anyhow::anyhow!("missing required flag: {flag}"))?;
-    args.get(idx + 1)
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("missing value for flag: {flag}"))
 }
 
 /// Notify systemd that the service is ready (Type=notify).

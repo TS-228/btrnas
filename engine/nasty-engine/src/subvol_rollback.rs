@@ -16,6 +16,7 @@
 use std::time::Duration;
 
 use nasty_sharing::nfs::UpdateNfsShareRequest;
+use nasty_sharing::rclone::UpdateRcloneShareRequest;
 use nasty_sharing::smb::UpdateSmbShareRequest;
 use nasty_storage::subvolume::{
     RollbackResult, RollbackSnapshotRequest, SubvolumeType, validate_existing_snapshot_name,
@@ -107,6 +108,9 @@ pub async fn rollback_with_dependents(
     // clients drop their handles during the swap. (Daemons stay up.)
     let smb_ids = set_smb_shares_enabled(state, &subvol_path, false).await;
     let nfs_ids = set_nfs_shares_enabled(state, &subvol_path, false).await;
+    let ftp_ids = set_rclone_shares_enabled(&state.ftp, &subvol_path, false).await;
+    let sftp_ids = set_rclone_shares_enabled(&state.sftp, &subvol_path, false).await;
+    let s3_ids = set_rclone_shares_enabled(&state.s3, &subvol_path, false).await;
 
     // ── Swap ──
     let result = state
@@ -118,6 +122,9 @@ pub async fn rollback_with_dependents(
     // ── Resume (best-effort, regardless of swap outcome — log, don't abort) ──
     reenable_nfs_shares(state, &nfs_ids).await;
     reenable_smb_shares(state, &smb_ids).await;
+    reenable_rclone_shares(&state.ftp, &ftp_ids).await;
+    reenable_rclone_shares(&state.sftp, &sftp_ids).await;
+    reenable_rclone_shares(&state.s3, &s3_ids).await;
     for (id, name) in &vm_ids {
         if let Err(e) = state.vms.start(id).await {
             warn!("Rollback: restart of VM '{name}' failed: {e}");
@@ -248,6 +255,52 @@ fn nfs_enabled_req(id: &str, enabled: bool) -> UpdateNfsShareRequest {
         comment: None,
         clients: None,
         enabled: Some(enabled),
+    }
+}
+
+fn rclone_enabled_req(id: &str, enabled: bool) -> UpdateRcloneShareRequest {
+    UpdateRcloneShareRequest {
+        id: id.to_string(),
+        name: None,
+        comment: None,
+        read_only: None,
+        enabled: Some(enabled),
+    }
+}
+
+async fn set_rclone_shares_enabled(
+    svc: &nasty_sharing::RcloneService,
+    subvol_path: &str,
+    enabled: bool,
+) -> Vec<String> {
+    let mut touched = Vec::new();
+    let Ok(shares) = svc.list().await else {
+        return touched;
+    };
+    let label = svc.kind().display_name();
+    for s in shares {
+        if s.enabled != enabled && path_in_subvol(&s.path, subvol_path) {
+            info!(
+                "Rollback cascade: {} {label} share '{}'",
+                if enabled { "re-enabling" } else { "disabling" },
+                s.name
+            );
+            if let Err(e) = svc.update(rclone_enabled_req(&s.id, enabled)).await {
+                warn!("Rollback: toggling {label} share '{}' failed: {e}", s.name);
+            } else {
+                touched.push(s.id);
+            }
+        }
+    }
+    touched
+}
+
+async fn reenable_rclone_shares(svc: &nasty_sharing::RcloneService, ids: &[String]) {
+    let label = svc.kind().display_name();
+    for id in ids {
+        if let Err(e) = svc.update(rclone_enabled_req(id, true)).await {
+            warn!("Rollback: re-enabling {label} share '{id}' failed: {e}");
+        }
     }
 }
 

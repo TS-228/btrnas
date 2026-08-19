@@ -4,10 +4,10 @@ export interface UpdatePhase {
 }
 
 export const versionUpdatePhases = [
-	{ label: 'Fetch', marker: '==> Updating staged system flake...' },
-	{ label: 'Build', marker: '==> Building staged system...' },
-	{ label: 'Activate', marker: '==> Activating verified system closure...' },
-	{ label: 'Done', marker: '==> Update complete!' }
+	{ label: 'Snapshot', marker: '==> Creating snapper pre-snapshot' },
+	{ label: 'Update', marker: '==> apt-get update' },
+	{ label: 'Upgrade', marker: '==> apt-get upgrade' },
+	{ label: 'Done', marker: '==> Upgrade finished' }
 ] as const satisfies readonly UpdatePhase[];
 
 export function reachedUpdatePhase(log: string, phases: readonly UpdatePhase[]): number {

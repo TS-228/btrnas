@@ -24,6 +24,22 @@ result-*
 .env
 .env.local
 
-# Claude Code
-.claude/
-CLAUDE.md
+# Debian packaging
+debian/files
+debian/*.debhelper
+debian/*.substvars
+debian/.debhelper/
+debian/nasty/
+debian/nasty-engine/
+debian/nasty-webui/
+debian/cargo-home/
+debian/tmp/
+debian/debhelper-build-stamp
+../nasty_*.deb
+../nasty-*.deb
+../nasty_*.changes
+../nasty_*.buildinfo
+../nasty_*.tar.*
+
+# Built .debs and webui output (do not ship)
+dist/

@@ -32,6 +32,10 @@ use nasty_sharing::nvmeof::{
     DeleteSubsystemRequest, NvmeofSubsystem, RemoveHostRequest, RemoveNamespaceRequest,
     RemovePortRequest, RepairNamespaceRequest,
 };
+use nasty_sharing::rclone::{
+    CreateRcloneShareRequest, DeleteRcloneShareRequest, RcloneSettings, RcloneShare,
+    UpdateRcloneSettingsRequest, UpdateRcloneShareRequest,
+};
 use nasty_sharing::smb::{
     CreateSmbShareRequest, CreateSmbUserRequest, DeleteSmbShareRequest, SmbGroup, SmbShare,
     SmbUser, UpdateSmbShareRequest,
@@ -51,8 +55,6 @@ use nasty_storage::subvolume::{
     Snapshot, Subvolume, UpdateSubvolumeRequest,
 };
 use nasty_system::alerts::{AlertAcknowledgement, AlertOccurrence, AlertRule, AlertRuleUpdate};
-use nasty_system::dc::{DcPrincipal, DcStatus, DemoteRequest, ProvisionRequest};
-use nasty_system::domain::{DomainPrincipal, DomainStatus, JoinDomainRequest, LeaveDomainRequest};
 use nasty_system::firewall::FirewallStatus;
 use nasty_system::firmware::{FirmwareConstraints, FirmwareDevice, FirmwareUpdateResult};
 use nasty_system::guest_tools::{GuestToolsStatus, GuestToolsUpdate};
@@ -64,8 +66,6 @@ use nasty_system::nut::{NutConfig, NutConfigUpdate, UpsStatus};
 use nasty_system::passthrough::{PassthroughConfig, PassthroughUpdate};
 use nasty_system::protocol::ProtocolStatus;
 use nasty_system::rdma::{RdmaSetRequest, RdmaStatus};
-use nasty_system::secure_boot::ReadinessReport;
-use nasty_system::secure_boot_enrollment::{EnrollmentState, EnrollmentStatusResponse};
 use nasty_system::settings::{AcmeStatus, HostTlsStatus, OidcSettings, Settings, SettingsUpdate};
 use nasty_system::tailscale::{TailscaleConnectRequest, TailscaleStatus};
 use nasty_system::tuning::{TuningConfig, TuningUpdate};
@@ -131,6 +131,74 @@ struct AuthMeResult {
     role: Role,
     file_principal: Option<String>,
     scoped: bool,
+}
+
+fn rclone_share_methods(
+    proto: &'static str,
+    label: &'static str,
+    generator: &mut SchemaGenerator,
+) -> Vec<Method> {
+    fn n(proto: &str, rest: &str) -> &'static str {
+        Box::leak(format!("share.{proto}.{rest}").into_boxed_str())
+    }
+    fn d(text: String) -> &'static str {
+        Box::leak(text.into_boxed_str())
+    }
+    vec![
+        Method {
+            name: n(proto, "list"),
+            desc: d(format!("List all {label} shares served by rclone.")),
+            role: MethodRole::Any,
+            params: MethodParams::None,
+            result: Some(gen_schema::<Vec<RcloneShare>>(generator)),
+        },
+        Method {
+            name: n(proto, "get"),
+            desc: d(format!("Get a {label} share by ID.")),
+            role: MethodRole::Any,
+            params: MethodParams::AdHoc(ad_hoc_one("id", "Unique share identifier.")),
+            result: Some(gen_schema::<RcloneShare>(generator)),
+        },
+        Method {
+            name: n(proto, "create"),
+            desc: d(format!("Create a {label} share served by rclone.")),
+            role: MethodRole::Operator,
+            params: MethodParams::Schema(gen_schema::<CreateRcloneShareRequest>(generator)),
+            result: Some(gen_schema::<RcloneShare>(generator)),
+        },
+        Method {
+            name: n(proto, "update"),
+            desc: d(format!("Update a {label} share.")),
+            role: MethodRole::Operator,
+            params: MethodParams::Schema(gen_schema::<UpdateRcloneShareRequest>(generator)),
+            result: Some(gen_schema::<RcloneShare>(generator)),
+        },
+        Method {
+            name: n(proto, "delete"),
+            desc: d(format!("Delete a {label} share.")),
+            role: MethodRole::Operator,
+            params: MethodParams::Schema(gen_schema::<DeleteRcloneShareRequest>(generator)),
+            result: None,
+        },
+        Method {
+            name: n(proto, "settings.get"),
+            desc: d(format!(
+                "Return {label} server settings including the decrypted password or S3 secret. Operator-only because the secret is returned in plaintext."
+            )),
+            role: MethodRole::Operator,
+            params: MethodParams::None,
+            result: Some(gen_schema::<RcloneSettings>(generator)),
+        },
+        Method {
+            name: n(proto, "settings.update"),
+            desc: d(format!(
+                "Update {label} listen address, port, and credentials. Omit password to keep the existing secret."
+            )),
+            role: MethodRole::Operator,
+            params: MethodParams::Schema(gen_schema::<UpdateRcloneSettingsRequest>(generator)),
+            result: Some(gen_schema::<RcloneSettings>(generator)),
+        },
+    ]
 }
 
 pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Vec<Method>)> {
@@ -222,7 +290,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
             vec![
                 Method {
                     name: "system.info",
-                    desc: "Return hostname, OS version, uptime, bcachefs-tools version info.",
+                    desc: "Return hostname, OS version, uptime, and related system info.",
                     role: MethodRole::Any,
                     params: MethodParams::None,
                     result: Some(gen_schema::<SystemInfo>(generator)),
@@ -250,7 +318,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "system.custom_config.get",
-                    desc: "Read /etc/nixos/custom.nix — the operator's own NixOS overlay (advanced, edited from the terminal). Returns whether the file exists and its contents for a read-only WebUI view; NASty never writes this file, so anything in it survives upgrades.",
+                    desc: "Read /etc/nasty/custom.conf — optional operator overlay (advanced, edited from the terminal). Returns whether the file exists and its contents for a read-only WebUI view; NASty never writes this file.",
                     role: MethodRole::Admin,
                     params: MethodParams::None,
                     result: Some(gen_schema::<nasty_system::CustomConfig>(generator)),
@@ -311,7 +379,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "system.update.apply",
-                    desc: "Fetch and apply the latest NixOS generation. Runs `nixos-rebuild switch` in the background.",
+                    desc: "Fetch and apply package updates via apt. Snapper creates btrfs snapshots around the upgrade.",
                     role: MethodRole::Admin,
                     params: MethodParams::None,
                     result: None,
@@ -437,11 +505,11 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "service.protocol.enable",
-                    desc: "Enable a protocol service. Available names: `nfs`, `smb`, `iscsi`, `nvmeof`, `ssh`, `avahi`, `smart`.",
+                    desc: "Enable a protocol service. Available names: `nfs`, `smb`, `iscsi`, `nvmeof`, `ftp`, `sftp`, `s3`, `ssh`, `avahi`, `smart`.",
                     role: MethodRole::Operator,
                     params: MethodParams::AdHoc(ad_hoc_one(
                         "name",
-                        "Protocol name (nfs, smb, iscsi, nvmeof, ssh, avahi, smart).",
+                        "Protocol name (nfs, smb, iscsi, nvmeof, ftp, sftp, s3, ssh, avahi, smart).",
                     )),
                     result: Some(gen_schema::<ProtocolStatus>(generator)),
                 },
@@ -451,7 +519,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                     role: MethodRole::Operator,
                     params: MethodParams::AdHoc(ad_hoc_one(
                         "name",
-                        "Protocol name (nfs, smb, iscsi, nvmeof, ssh, avahi, smart).",
+                        "Protocol name (nfs, smb, iscsi, nvmeof, ftp, sftp, s3, ssh, avahi, smart).",
                     )),
                     result: Some(gen_schema::<ProtocolStatus>(generator)),
                 },
@@ -512,7 +580,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "device.wipe",
-                    desc: "Erase all filesystem signatures from a device (wipefs). The device must not be in use.",
+                    desc: "Erase filesystem signatures from a device (wipefs). Stops md/dm/swap holders first when needed. Refuses if the device or a holder is mounted.",
                     role: MethodRole::Admin,
                     params: MethodParams::AdHoc(ad_hoc_one(
                         "path",
@@ -562,7 +630,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "fs.create",
-                    desc: "Format and mount a new bcachefs filesystem.",
+                    desc: "Format and mount a new btrfs filesystem under /fs/.",
                     role: MethodRole::Admin,
                     params: MethodParams::Schema(gen_schema::<CreateFilesystemRequest>(generator)),
                     result: Some(gen_schema::<Filesystem>(generator)),
@@ -597,7 +665,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "fs.options.update",
-                    desc: "Update runtime-mutable bcachefs filesystem options (written to sysfs).",
+                    desc: "Update runtime-mutable filesystem options (compression remount on btrfs).",
                     role: MethodRole::Admin,
                     params: MethodParams::Schema(gen_schema::<UpdateFilesystemOptionsRequest>(
                         generator,
@@ -606,7 +674,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "fs.usage",
-                    desc: "Return detailed bcachefs `fs usage` breakdown.",
+                    desc: "Return detailed `btrfs filesystem usage` breakdown.",
                     role: MethodRole::Any,
                     params: MethodParams::AdHoc(ad_hoc_one("name", "Filesystem name.")),
                     result: Some(gen_schema::<FsUsage>(generator)),
@@ -627,7 +695,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "fs.scrub.cancel",
-                    desc: "Cancel a running scrub by terminating its bcachefs process (#553).",
+                    desc: "Cancel a running `btrfs scrub`.",
                     role: MethodRole::Admin,
                     params: MethodParams::AdHoc(ad_hoc_one("name", "Filesystem name.")),
                     result: None,
@@ -772,7 +840,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "subvolume.create",
-                    desc: "Create a new bcachefs subvolume (filesystem or block-backed).",
+                    desc: "Create a new btrfs subvolume (filesystem or block-backed).",
                     role: MethodRole::Operator,
                     params: MethodParams::Schema(gen_schema::<CreateSubvolumeRequest>(generator)),
                     result: Some(gen_schema::<Subvolume>(generator)),
@@ -961,6 +1029,12 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
             ],
         ),
+        ("FTP Shares", rclone_share_methods("ftp", "FTP", generator)),
+        (
+            "SFTP Shares",
+            rclone_share_methods("sftp", "SFTP", generator),
+        ),
+        ("S3 Shares", rclone_share_methods("s3", "S3", generator)),
         (
             "iSCSI Targets",
             vec![
@@ -1654,65 +1728,6 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
             ],
         ),
-        // ── System: Secure Boot ──────────────────────────────────────────
-        (
-            "System Secure Boot",
-            vec![
-                Method {
-                    name: "system.secure_boot.readiness",
-                    desc: "Compute the Secure Boot readiness checklist (UEFI/TPM/ESP space/lanzaboote-in-flake/sbctl keys) for the Hardware page.",
-                    role: MethodRole::Any,
-                    params: MethodParams::None,
-                    result: Some(gen_schema::<ReadinessReport>(generator)),
-                },
-                Method {
-                    name: "system.secure_boot.enrollment.status",
-                    desc: "Return the combined persistent enrollment state plus the live `nasty-rebuild` unit snapshot.",
-                    role: MethodRole::Any,
-                    params: MethodParams::None,
-                    result: Some(gen_schema::<EnrollmentStatusResponse>(generator)),
-                },
-                Method {
-                    name: "system.secure_boot.enrollment.begin",
-                    desc: "Start the Secure Boot enrollment ceremony by writing the lanzaboote Nix overlay and locking inputs.",
-                    role: MethodRole::Admin,
-                    params: MethodParams::None,
-                    result: Some(gen_schema::<EnrollmentState>(generator)),
-                },
-                Method {
-                    name: "system.secure_boot.enrollment.rebuild",
-                    desc: "Trigger `nasty-rebuild` via systemd-run to apply the enrollment overlay the wizard wrote.",
-                    role: MethodRole::Admin,
-                    params: MethodParams::None,
-                    result: Some(serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "triggered": {"type": "boolean", "enum": [true]}
-                        },
-                        "required": ["triggered"]
-                    })),
-                },
-                Method {
-                    name: "system.secure_boot.enrollment.complete",
-                    desc: "Mark the Secure Boot enrollment ceremony done (only valid from PostEnrollment phase).",
-                    role: MethodRole::Admin,
-                    params: MethodParams::None,
-                    result: Some(gen_schema::<EnrollmentState>(generator)),
-                },
-                Method {
-                    name: "system.secure_boot.enrollment.abort",
-                    desc: "Abort an in-progress Secure Boot enrollment by removing the lanzaboote overlay and lock entries.",
-                    role: MethodRole::Admin,
-                    params: MethodParams::AdHoc(serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "reason": {"type": "string", "description": "Optional operator-supplied reason recorded in audit log."}
-                        }
-                    })),
-                    result: Some(gen_schema::<EnrollmentState>(generator)),
-                },
-            ],
-        ),
         // ── System: SSH ──────────────────────────────────────────────────
         (
             "System SSH",
@@ -2101,7 +2116,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                 },
                 Method {
                     name: "firmware.constraints",
-                    desc: "Return a snapshot of system-level blockers on applying firmware updates (today: whether Secure Boot enforcement is preventing fwupd's capsule shim per lanzaboote#591).",
+                    desc: "Return a snapshot of system-level blockers on applying firmware updates (e.g. whether firmware Secure Boot enforcement blocks fwupd apply).",
                     role: MethodRole::Any,
                     params: MethodParams::None,
                     result: Some(gen_schema::<FirmwareConstraints>(generator)),
@@ -2290,7 +2305,7 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
             vec![
                 Method {
                     name: "smb.user.list",
-                    desc: "List SMB users by parsing `pdbedit -L` output and filtering to UIDs ≥ 3000.",
+                    desc: "List local SMB (ksmbd) users managed by the engine.",
                     role: MethodRole::Any,
                     params: MethodParams::None,
                     result: Some(gen_schema::<Vec<SmbUser>>(generator)),
@@ -2371,215 +2386,6 @@ pub(super) fn registry(generator: &mut SchemaGenerator) -> Vec<(&'static str, Ve
                         "Username to remove.",
                     )),
                     result: None,
-                },
-            ],
-        ),
-        // ── Active Directory ────────────────────────────────────────────
-        (
-            "Active Directory",
-            vec![
-                Method {
-                    name: "domain.status",
-                    desc: "Report AD membership: joined state, realm, trust health (wbinfo -t), DC reachability, and clock skew.",
-                    role: MethodRole::Any,
-                    params: MethodParams::None,
-                    result: Some(gen_schema::<DomainStatus>(generator)),
-                },
-                Method {
-                    name: "domain.join",
-                    desc: "Join an Active Directory domain. Runs preflight (DNS SRV, DC reachability, clock skew) before touching Kerberos; the admin credential is used once over stdin and never stored. Configuration rolls back on any failure.",
-                    role: MethodRole::Admin,
-                    params: MethodParams::Schema(gen_schema::<JoinDomainRequest>(generator)),
-                    result: Some(gen_schema::<DomainStatus>(generator)),
-                },
-                Method {
-                    name: "domain.leave",
-                    desc: "Leave the AD domain. With credentials the computer account is removed from AD; with force=true the leave is local-only and the account goes stale.",
-                    role: MethodRole::Admin,
-                    params: MethodParams::Schema(gen_schema::<LeaveDomainRequest>(generator)),
-                    result: None,
-                },
-                Method {
-                    name: "domain.user.list",
-                    desc: "Search domain users by account-name prefix (min 2 chars, capped at 50). Live winbind query — domain users are never copied into NASty.",
-                    role: MethodRole::Admin,
-                    params: MethodParams::AdHoc(ad_hoc_one(
-                        "prefix",
-                        "Account name prefix to search for.",
-                    )),
-                    result: Some(gen_schema::<Vec<DomainPrincipal>>(generator)),
-                },
-                Method {
-                    name: "domain.group.list",
-                    desc: "Search domain groups by name prefix (min 2 chars, capped at 50).",
-                    role: MethodRole::Admin,
-                    params: MethodParams::AdHoc(ad_hoc_one(
-                        "prefix",
-                        "Group name prefix to search for.",
-                    )),
-                    result: Some(gen_schema::<Vec<DomainPrincipal>>(generator)),
-                },
-            ],
-        ),
-        // ── Active Directory: Domain Controller ──────────────────────────
-        (
-            "Active Directory: Domain Controller",
-            vec![
-                Method {
-                    name: "dc.status",
-                    desc: "Report this box's Domain Controller role: hosting state, realm, workgroup, DNS forwarder, and samba-dc.service health.",
-                    role: MethodRole::Any,
-                    params: MethodParams::None,
-                    result: Some(gen_schema::<DcStatus>(generator)),
-                },
-                Method {
-                    name: "dc.provision",
-                    desc: "Provision a brand-new Active Directory domain on this box (Samba AD DC, internal DNS). Exactly one DC per domain; refuses when the box is domain-joined. The Administrator password is set over stdin and never logged. Returns { status, warnings }.",
-                    role: MethodRole::Admin,
-                    params: MethodParams::Schema(gen_schema::<ProvisionRequest>(generator)),
-                    result: Some(serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "status": gen_schema::<DcStatus>(generator),
-                            "warnings": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "Operator-facing warnings surfaced during provisioning (e.g. externally-managed network config)."
-                            }
-                        },
-                        "required": ["status", "warnings"]
-                    })),
-                },
-                Method {
-                    name: "dc.demote",
-                    desc: "Demote the DC — DESTROYS the hosted domain (typed-realm confirmation required). Takes a final domain backup into /fs when a filesystem exists, then tears the role down.",
-                    role: MethodRole::Admin,
-                    params: MethodParams::Schema(gen_schema::<DemoteRequest>(generator)),
-                    result: None,
-                },
-                Method {
-                    name: "dc.backup",
-                    desc: "Run `samba-tool domain backup offline` into a /fs-jailed directory and return the tarball path. Ship it offsite with a backup profile.",
-                    role: MethodRole::Admin,
-                    params: MethodParams::AdHoc(ad_hoc_one(
-                        "dest",
-                        "Backup target directory; must resolve under /fs and be empty or absent.",
-                    )),
-                    result: Some(serde_json::json!({
-                        "type": "object",
-                        "properties": {
-                            "path": {"type": "string", "description": "Path to the written backup tarball."}
-                        },
-                        "required": ["path"]
-                    })),
-                },
-                Method {
-                    name: "dc.user.list",
-                    desc: "List domain users (Admin — enumerates the hosted directory).",
-                    role: MethodRole::Admin,
-                    params: MethodParams::None,
-                    result: Some(gen_schema::<Vec<DcPrincipal>>(generator)),
-                },
-                Method {
-                    name: "dc.user.create",
-                    desc: "Create a domain user via `samba-tool user create`. The password is fed over stdin (prompt + confirmation) — never argv, never logged.",
-                    role: MethodRole::Admin,
-                    params: MethodParams::AdHoc(serde_json::json!({
-                        "type": "object",
-                        "required": ["name", "password"],
-                        "properties": {
-                            "name": { "type": "string", "description": "Domain username (sAMAccountName)." },
-                            "password": { "type": "string", "description": "Initial password. Sent over stdin — never argv, never logged." },
-                            "given_name": { "type": "string", "description": "Optional given (first) name." },
-                            "surname": { "type": "string", "description": "Optional surname (last) name." }
-                        }
-                    })),
-                    result: None,
-                },
-                Method {
-                    name: "dc.user.delete",
-                    desc: "Delete a domain user via `samba-tool user delete`.",
-                    role: MethodRole::Admin,
-                    params: MethodParams::AdHoc(ad_hoc_one("name", "Domain username to delete.")),
-                    result: None,
-                },
-                Method {
-                    name: "dc.user.set_password",
-                    desc: "Reset a domain user's password via `samba-tool user setpassword`. Sent over stdin — never argv, never logged.",
-                    role: MethodRole::Admin,
-                    params: MethodParams::AdHoc(ad_hoc_two(
-                        "name",
-                        "Domain username.",
-                        "password",
-                        "New password. Sent over stdin — never argv, never logged.",
-                    )),
-                    result: None,
-                },
-                Method {
-                    name: "dc.user.enable",
-                    desc: "Enable a previously disabled domain user account via `samba-tool user enable`.",
-                    role: MethodRole::Admin,
-                    params: MethodParams::AdHoc(ad_hoc_one("name", "Domain username to enable.")),
-                    result: None,
-                },
-                Method {
-                    name: "dc.user.disable",
-                    desc: "Disable a domain user account via `samba-tool user disable` — the account remains but cannot authenticate.",
-                    role: MethodRole::Admin,
-                    params: MethodParams::AdHoc(ad_hoc_one("name", "Domain username to disable.")),
-                    result: None,
-                },
-                Method {
-                    name: "dc.group.list",
-                    desc: "List domain groups (Admin — enumerates the hosted directory).",
-                    role: MethodRole::Admin,
-                    params: MethodParams::None,
-                    result: Some(gen_schema::<Vec<DcPrincipal>>(generator)),
-                },
-                Method {
-                    name: "dc.group.create",
-                    desc: "Create a domain security group via `samba-tool group add`.",
-                    role: MethodRole::Admin,
-                    params: MethodParams::AdHoc(ad_hoc_one("name", "Domain group name to create.")),
-                    result: None,
-                },
-                Method {
-                    name: "dc.group.delete",
-                    desc: "Delete a domain group via `samba-tool group delete`.",
-                    role: MethodRole::Admin,
-                    params: MethodParams::AdHoc(ad_hoc_one("name", "Domain group name to delete.")),
-                    result: None,
-                },
-                Method {
-                    name: "dc.group.add_member",
-                    desc: "Add a member to a domain group via `samba-tool group addmembers`.",
-                    role: MethodRole::Admin,
-                    params: MethodParams::AdHoc(ad_hoc_two(
-                        "group",
-                        "Domain group name.",
-                        "member",
-                        "Username to add to the group.",
-                    )),
-                    result: None,
-                },
-                Method {
-                    name: "dc.group.remove_member",
-                    desc: "Remove a member from a domain group via `samba-tool group removemembers`.",
-                    role: MethodRole::Admin,
-                    params: MethodParams::AdHoc(ad_hoc_two(
-                        "group",
-                        "Domain group name.",
-                        "member",
-                        "Username to remove from the group.",
-                    )),
-                    result: None,
-                },
-                Method {
-                    name: "dc.computer.list",
-                    desc: "List joined computers (Admin — enumerates the hosted directory).",
-                    role: MethodRole::Admin,
-                    params: MethodParams::None,
-                    result: Some(gen_schema::<Vec<DcPrincipal>>(generator)),
                 },
             ],
         ),

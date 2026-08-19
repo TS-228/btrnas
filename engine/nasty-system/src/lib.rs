@@ -1,6 +1,4 @@
 pub mod alerts;
-pub mod dc;
-pub mod domain;
 pub mod firewall;
 pub mod firmware;
 pub mod guest_tools;
@@ -12,8 +10,6 @@ pub mod passthrough;
 pub mod protocol;
 pub mod rdma;
 pub mod rest_server;
-pub mod secure_boot;
-pub mod secure_boot_enrollment;
 pub mod settings;
 pub mod tailscale;
 pub mod tuning;
@@ -152,9 +148,8 @@ pub struct ActiveOperation {
     pub detail: String,
 }
 
-/// The operator's own NixOS overlay at `/etc/nixos/custom.nix`, surfaced
-/// read-only in the WebUI. NASty never writes this file — advanced operators
-/// edit it from the terminal, and it survives reboots and upgrades.
+/// The operator's optional overlay at `/etc/nasty/custom.conf`, surfaced
+/// read-only in the WebUI. NASty never writes this file.
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct CustomConfig {
     /// Absolute path of the overlay file.
@@ -305,38 +300,12 @@ impl SystemService {
         // ref baked into the engine at compile time. Cheap, and it means
         // the top-bar chip reflects a re-pin the moment the rebuild
         // rewrites flake.lock — no waiting on cache invalidation.
-        let ((pinned_ref, pinned_rev), (timezone, ntp_synced)) = tokio::join!(
-            crate::update::read_flake_lock_bcachefs_pub(),
-            timedatectl_info(),
-        );
-        // The bcachefs ref this engine build ships with — parsed from
-        // nasty's flake.nix baked in at compile time. Drives the chip's
-        // "sync to bundled bcachefs" offer when it differs from the pin.
-        let bcachefs_recommended_ref = crate::update::embedded_default_bcachefs_tools_ref().ok();
-        // "Pending reboot": the loaded kernel module's bcachefs version
-        // doesn't match the wrapper's currently-pinned bcachefs-tools
-        // ref. Happens after the operator changes the pin (or runs a
-        // tagged-release switch) and nixos-rebuild has activated the
-        // new generation but the box hasn't been rebooted into it yet
-        // — the new kernel module is sitting in /run/booted-system but
-        // not loaded. Surfacing this in the top-bar chip is the cue to
-        // reboot.
-        //
-        // We DON'T trip when:
-        //   - the running version is "unknown" (probe failure — don't
-        //     show a misleading alert based on incomplete data);
-        //   - the pinned ref is missing (no /etc/nixos/flake.lock —
-        //     dev/test environment, nothing to compare against).
-        //
-        // Strip leading 'v' on the pinned ref so `v1.38.3` compares
-        // equal to bcachefs's `1.38.3` runtime output.
-        let bcachefs_is_custom = match (&pinned_ref, cached.bcachefs_version.as_str()) {
-            (Some(pin), running) if running != "unknown" => {
-                let pin_bare = pin.strip_prefix('v').unwrap_or(pin);
-                pin_bare != running
-            }
-            _ => false,
-        };
+        let (timezone, ntp_synced) = timedatectl_info().await;
+        // Debian/btrfs port: no flake.lock pin for bcachefs-tools.
+        let pinned_ref: Option<String> = None;
+        let pinned_rev: Option<String> = None;
+        let bcachefs_recommended_ref: Option<String> = None;
+        let bcachefs_is_custom = false;
 
         SystemInfo {
             hostname: hostname(),

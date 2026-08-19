@@ -1,0 +1,38 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+  configure)
+    mkdir -p /var/lib/nasty /etc/nasty /fs
+    # Ensure snapper root config exists when / is btrfs.
+    if command -v snapper >/dev/null 2>&1 && command -v findmnt >/dev/null 2>&1; then
+      fstype=$(findmnt -no FSTYPE / 2>/dev/null || true)
+      if [ "$fstype" = "btrfs" ]; then
+        if ! snapper -c root get-config >/dev/null 2>&1; then
+          snapper -c root create-config / || true
+        fi
+      fi
+    fi
+    if [ -f /usr/share/nasty/firewall-baseline.nft ] && command -v nft >/dev/null 2>&1; then
+      nft -f /usr/share/nasty/firewall-baseline.nft 2>/dev/null || true
+    fi
+    deb-systemd-helper enable nasty-metrics.service >/dev/null || true
+    deb-systemd-helper enable nasty-engine.service >/dev/null || true
+    # wsdd2 drop-in binds to ksmbd (not Samba smbd); enable so ksmbd pulls it in.
+    if [ -f /usr/lib/systemd/system/wsdd2.service ]; then
+      deb-systemd-helper enable wsdd2.service >/dev/null || true
+    fi
+    if [ -d /run/systemd/system ]; then
+      systemctl daemon-reload || true
+      systemctl start nasty-metrics.service || true
+      systemctl start nasty-engine.service || true
+      if systemctl is-active --quiet ksmbd.service 2>/dev/null; then
+        systemctl start wsdd2.service || true
+      fi
+    fi
+    ;;
+esac
+
+#DEBHELPER#
+
+exit 0

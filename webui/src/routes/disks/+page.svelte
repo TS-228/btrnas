@@ -104,12 +104,43 @@
 	}
 
 	async function wipe(dev: BlockDevice) {
-		if (!await confirm(`Wipe ${dev.path}?`, `This will erase all filesystem signatures on ${dev.path}. The data itself is not overwritten but the device will appear blank.`)) return;
+		const holders = dev.holders?.length
+			? ` This will stop holders (${dev.holders.join(', ')}) first.`
+			: '';
+		const partsNote =
+			dev.dev_type === 'disk' && diskHasPartitions(dev.path)
+				? ' This removes the partition table and all partitions on the disk.'
+				: '';
+		if (!await confirm(
+			`Wipe ${dev.path}?`,
+			`This will erase all filesystem signatures on ${dev.path}.${holders}${partsNote} The data itself is not overwritten but the device will appear blank.`
+		)) return;
 		const ok = await withToast(
 			() => client.call('device.wipe', { path: dev.path }),
 			`${dev.path} wiped`
 		);
 		if (ok !== undefined) await loadBlockDevices();
+	}
+
+	function diskHasPartitions(diskPath: string): boolean {
+		return blockDevices.some(
+			(d) =>
+				d.dev_type === 'part' &&
+				d.path.startsWith(diskPath) &&
+				d.path !== diskPath
+		);
+	}
+
+	/** Show Wipe/Reclaim for reclaimable disks, including partitioned disks
+	 * with no live holders/fs_type (common after stopping old md arrays). */
+	function showWipeAction(dev: BlockDevice): boolean {
+		if (!(dev.wipeable ?? !dev.in_use)) return false;
+		if (dev.dev_type === 'free') return false;
+		if (dev.size_bytes === 0) return false; // empty nbd/loop
+		if (dev.fs_type || dev.holders?.length || dev.in_use) return true;
+		if (dev.dev_type === 'disk' && diskHasPartitions(dev.path)) return true;
+		if (dev.dev_type === 'part') return true;
+		return false;
 	}
 
 	// Manual disk-type override (#552): for VMs where lsblk's rotational
@@ -400,16 +431,25 @@
 						<td class="p-3">
 							{#if dev.in_use}
 								<Badge variant="default">In use</Badge>
+								{#if dev.holders?.length}
+									<Badge variant="outline" class="ml-1 border-amber-700 text-amber-400" title={dev.holders.join(', ')}>
+										Held by {dev.holders.join(', ')}
+									</Badge>
+								{/if}
 							{:else}
 								<Badge variant="secondary">Free</Badge>
 								{#if dev.fs_type}
 									<Badge variant="outline" class="ml-1 border-amber-700 text-amber-400">Has signatures</Badge>
+								{:else if dev.dev_type === 'disk' && diskHasPartitions(dev.path)}
+									<Badge variant="outline" class="ml-1 border-amber-700 text-amber-400">Has partitions</Badge>
 								{/if}
 							{/if}
 						</td>
 						<td class="p-3 w-px whitespace-nowrap">
-							{#if !dev.in_use && dev.fs_type}
-								<Button variant="destructive" size="xs" onclick={() => wipe(dev)} disabled={schedulerPending[dev.path]}>Wipe</Button>
+							{#if showWipeAction(dev)}
+								<Button variant="destructive" size="xs" onclick={() => wipe(dev)} disabled={schedulerPending[dev.path] || !isAdmin}>
+									{dev.in_use || (dev.holders?.length ?? 0) > 0 ? 'Reclaim' : 'Wipe'}
+								</Button>
 							{/if}
 						</td>
 					</tr>

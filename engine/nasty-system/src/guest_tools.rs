@@ -25,7 +25,6 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 const STATE_PATH: &str = "/var/lib/nasty/guest-tools.json";
-const NIX_PATH: &str = "/etc/nixos/guest-tools.nix";
 const REBUILD_UNIT: &str = "nasty-guest-tools-rebuild";
 const REBUILD_SCRIPT: &str = "/tmp/nasty-guest-tools-rebuild.sh";
 
@@ -135,16 +134,9 @@ fn guest_module_lines(hv: &str) -> String {
 /// before rebootstrap (`/etc/nixos` absent) this is a no-op — state.json
 /// still persists so the next rebootstrap picks it up.
 async fn write_nix_file(enabled: bool, hv: &str) -> Result<(), String> {
-    let Some(nix_dir) = std::path::Path::new(NIX_PATH).parent() else {
-        return Err(format!("{NIX_PATH}: no parent dir"));
-    };
-    if !nix_dir.exists() {
-        return Ok(());
-    }
-    let body = render_nix_module(enabled, hv);
-    tokio::fs::write(NIX_PATH, body)
-        .await
-        .map_err(|e| format!("write {NIX_PATH}: {e}"))
+    // Debian: guest-tools state lives in JSON; no Nix overlay.
+    let _ = (enabled, hv);
+    Ok(())
 }
 
 /// Persist the opt-in flag, regenerate the overlay, and kick off an
@@ -176,7 +168,7 @@ pub async fn set_and_apply(update: GuestToolsUpdate) -> Result<GuestToolsStatus,
         write_nix_file(update.enabled, &hv).await?;
     }
 
-    spawn_rebuild().await?;
+    spawn_rebuild(update.enabled).await?;
     info!(
         "VM guest tools {} (hypervisor: {hv}); rebuild started",
         if update.enabled {
@@ -188,32 +180,23 @@ pub async fn set_and_apply(update: GuestToolsUpdate) -> Result<GuestToolsStatus,
     Ok(status().await)
 }
 
-/// Launch `nixos-rebuild switch` as a transient systemd unit so it runs
-/// outside the engine's `ProtectSystem` sandbox (mirrors `update::apply`).
-/// No GitHub token is needed: the overlay changes no flake inputs, so the
-/// switch resolves against the already-locked flake and pulls
-/// `open-vm-tools` from the binary cache.
-async fn spawn_rebuild() -> Result<(), String> {
-    // Best-effort: clear any prior failed unit so the name is reusable.
+/// On Debian, guest tools are apt packages — install/remove via apt
+/// instead of nixos-rebuild.
+async fn spawn_rebuild(enabled: bool) -> Result<(), String> {
     nasty_common::cmd::try_run("systemctl", &["reset-failed", REBUILD_UNIT]).await;
 
-    let tmpdir_line = match crate::update::read_update_build_dir().await {
-        Some(dir) => format!("export TMPDIR={dir}\nmkdir -p \"$TMPDIR\" || true\n"),
-        None => String::new(),
-    };
+    let want = if enabled { "true" } else { "false" };
 
     let script = format!(
         r#"#!/bin/bash
 set -euo pipefail
-export PATH="/run/current-system/sw/bin:$PATH"
-{tmpdir_line}echo "==> Applying VM guest tools (nixos-rebuild switch)..."
-_RC=0
-NIXOS_INSTALL_BOOTLOADER=0 nixos-rebuild switch --flake /etc/nixos#nasty || _RC=$?
-if [ "$_RC" -ne 0 ]; then
-    echo "==> nixos-rebuild switch failed (exit $_RC)."
-    echo "--- journalctl -u nixos-rebuild-switch-to-configuration -n 40 ---"
-    journalctl -u nixos-rebuild-switch-to-configuration --no-pager -n 40 || true
-    exit "$_RC"
+export DEBIAN_FRONTEND=noninteractive
+echo "==> Applying VM guest tools via apt..."
+if {want}; then
+  apt-get update -y || true
+  apt-get install -y open-vm-tools || true
+else
+  apt-get remove -y open-vm-tools open-vm-tools-desktop 2>/dev/null || true
 fi
 echo "==> VM guest tools applied."
 "#
@@ -223,24 +206,20 @@ echo "==> VM guest tools applied."
         .await
         .map_err(|e| format!("write rebuild script: {e}"))?;
 
-    let path = std::env::var("PATH").unwrap_or_default();
     let output = tokio::process::Command::new("systemd-run")
         .args([
             "--unit",
             REBUILD_UNIT,
             "--no-block",
             "--description",
-            "NASty VM guest-tools rebuild",
+            "NASty VM guest-tools apt apply",
             "--property=Type=oneshot",
             "--property=StandardOutput=journal",
             "--property=StandardError=journal",
-            "--property=Nice=10",
-            "--property=IOSchedulingClass=best-effort",
-            "--property=IOSchedulingPriority=7",
-            "--setenv",
+            "--",
+            "bash",
+            REBUILD_SCRIPT,
         ])
-        .arg(format!("PATH={path}"))
-        .args(["--", "bash", REBUILD_SCRIPT])
         .output()
         .await
         .map_err(|e| format!("systemd-run: {e}"))?;

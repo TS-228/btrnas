@@ -39,6 +39,9 @@ pub struct FsDependents {
     pub backup_jobs: Vec<String>,
     pub nfs_shares: Vec<String>,
     pub smb_shares: Vec<String>,
+    pub ftp_shares: Vec<String>,
+    pub sftp_shares: Vec<String>,
+    pub s3_shares: Vec<String>,
     pub iscsi_targets: Vec<String>,
     pub nvmeof_subsystems: Vec<String>,
     pub state_errors: Vec<String>,
@@ -53,6 +56,9 @@ impl FsDependents {
             || !self.backup_jobs.is_empty()
             || !self.nfs_shares.is_empty()
             || !self.smb_shares.is_empty()
+            || !self.ftp_shares.is_empty()
+            || !self.sftp_shares.is_empty()
+            || !self.s3_shares.is_empty()
             || !self.iscsi_targets.is_empty()
             || !self.nvmeof_subsystems.is_empty()
     }
@@ -211,6 +217,42 @@ pub async fn find_dependents_with_uuid(
         Err(error) => out
             .state_errors
             .push(format!("SMB state failed to load: {error}")),
+    }
+    match state.ftp.list_strict().await {
+        Ok(shares) => {
+            out.ftp_shares = shares
+                .into_iter()
+                .filter(|s| path_belongs_to_fs(&s.path, fs_name))
+                .map(|s| s.name)
+                .collect();
+        }
+        Err(error) => out
+            .state_errors
+            .push(format!("FTP state failed to load: {error}")),
+    }
+    match state.sftp.list_strict().await {
+        Ok(shares) => {
+            out.sftp_shares = shares
+                .into_iter()
+                .filter(|s| path_belongs_to_fs(&s.path, fs_name))
+                .map(|s| s.name)
+                .collect();
+        }
+        Err(error) => out
+            .state_errors
+            .push(format!("SFTP state failed to load: {error}")),
+    }
+    match state.s3.list_strict().await {
+        Ok(shares) => {
+            out.s3_shares = shares
+                .into_iter()
+                .filter(|s| path_belongs_to_fs(&s.path, fs_name))
+                .map(|s| s.name)
+                .collect();
+        }
+        Err(error) => out
+            .state_errors
+            .push(format!("S3 state failed to load: {error}")),
     }
     match state.iscsi.list().await {
         Ok(targets) => {
