@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 160" role="img" aria-label="btrNAS">
+  <title>btrNAS</title>
+  <g transform="translate(4,16)">
+    <rect width="128" height="128" rx="28" fill="#2dd4bf"/>
+    <rect x="14" y="14" width="100" height="100" rx="18" fill="#042f2e"/>
+    <circle cx="64" cy="40" r="11" fill="#ccfbf1"/>
+    <circle cx="40" cy="78" r="10" fill="#5eead4"/>
+    <circle cx="88" cy="78" r="10" fill="#5eead4"/>
+    <circle cx="28" cy="112" r="8" fill="#99f6e4"/>
+    <circle cx="52" cy="112" r="8" fill="#99f6e4"/>
+    <circle cx="76" cy="112" r="8" fill="#99f6e4"/>
+    <circle cx="100" cy="112" r="8" fill="#99f6e4"/>
+    <path d="M64 51 L40 68 M64 51 L88 68 M40 88 L28 104 M40 88 L52 104 M88 88 L76 104 M88 88 L100 104"
+          stroke="#5eead4" stroke-width="4" stroke-linecap="round" fill="none" opacity="0.95"/>
+  </g>
+  <g transform="translate(156,52)" font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif"
+     font-size="78" font-weight="800" letter-spacing="-0.04em">
+    <text x="0" y="62"><tspan fill="#5eead4">btr</tspan><tspan fill="#f8fafc">NAS</tspan></text>
+  </g>
+</svg>

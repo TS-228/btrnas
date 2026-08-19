@@ -1,17 +1,42 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 160" role="img" aria-label="btrNAS">
   <title>btrNAS</title>
-  <g transform="translate(4,16)">
-    <rect width="128" height="128" rx="28" fill="#2dd4bf"/>
-    <rect x="14" y="14" width="100" height="100" rx="18" fill="#042f2e"/>
-    <circle cx="64" cy="40" r="11" fill="#ccfbf1"/>
-    <circle cx="40" cy="78" r="10" fill="#5eead4"/>
-    <circle cx="88" cy="78" r="10" fill="#5eead4"/>
-    <circle cx="28" cy="112" r="8" fill="#99f6e4"/>
-    <circle cx="52" cy="112" r="8" fill="#99f6e4"/>
-    <circle cx="76" cy="112" r="8" fill="#99f6e4"/>
-    <circle cx="100" cy="112" r="8" fill="#99f6e4"/>
-    <path d="M64 51 L40 68 M64 51 L88 68 M40 88 L28 104 M40 88 L52 104 M88 88 L76 104 M88 88 L100 104"
-          stroke="#5eead4" stroke-width="4" stroke-linecap="round" fill="none" opacity="0.95"/>
+  <g transform="translate(4,16) scale(2)">
+    <rect width="64" height="64" rx="14" fill="#2dd4bf"/>
+    <rect x="11" y="8" width="42" height="48" rx="6" fill="#042f2e"/>
+    <path d="M17 8h30a6 6 0 0 1 6 6v3H11v-3a6 6 0 0 1 6-6z" fill="#134e4a"/>
+    <rect x="23" y="11" width="4.5" height="1.8" rx="0.7" fill="#ccfbf1" opacity="0.55"/>
+    <rect x="29.75" y="11" width="4.5" height="1.8" rx="0.7" fill="#ccfbf1" opacity="0.55"/>
+    <rect x="36.5" y="11" width="4.5" height="1.8" rx="0.7" fill="#ccfbf1" opacity="0.55"/>
+    <g>
+      <g transform="translate(0 17)">
+        <rect x="15" y="0" width="34" height="7.2" rx="1.5" fill="#0f766e"/>
+        <circle cx="18.8" cy="3.6" r="1.25" fill="#ccfbf1"/>
+        <rect x="22.2" y="2" width="18.5" height="3.2" rx="0.7" fill="#042f2e"/>
+        <rect x="44.4" y="1.8" width="2.6" height="3.6" rx="0.45" fill="#5eead4"/>
+      </g>
+      <g transform="translate(0 25.8)">
+        <rect x="15" y="0" width="34" height="7.2" rx="1.5" fill="#0f766e"/>
+        <circle cx="18.8" cy="3.6" r="1.25" fill="#ccfbf1"/>
+        <rect x="22.2" y="2" width="18.5" height="3.2" rx="0.7" fill="#042f2e"/>
+        <rect x="44.4" y="1.8" width="2.6" height="3.6" rx="0.45" fill="#5eead4"/>
+      </g>
+      <g transform="translate(0 34.6)">
+        <rect x="15" y="0" width="34" height="7.2" rx="1.5" fill="#0f766e"/>
+        <circle cx="18.8" cy="3.6" r="1.25" fill="#ccfbf1"/>
+        <rect x="22.2" y="2" width="18.5" height="3.2" rx="0.7" fill="#042f2e"/>
+        <rect x="44.4" y="1.8" width="2.6" height="3.6" rx="0.45" fill="#5eead4"/>
+      </g>
+      <g transform="translate(0 43.4)">
+        <rect x="15" y="0" width="34" height="7.2" rx="1.5" fill="#0f766e"/>
+        <circle cx="18.8" cy="3.6" r="1.25" fill="#4ade80"/>
+        <rect x="22.2" y="2" width="18.5" height="3.2" rx="0.7" fill="#042f2e"/>
+        <rect x="44.4" y="1.8" width="2.6" height="3.6" rx="0.45" fill="#5eead4"/>
+      </g>
+    </g>
+    <circle cx="18.5" cy="54.1" r="1.35" fill="#4ade80"/>
+    <circle cx="23.4" cy="54.1" r="1.35" fill="#fbbf24"/>
+    <rect x="39" y="52.6" width="10" height="3.2" rx="0.6" fill="#134e4a"/>
+    <rect x="40.3" y="53.3" width="7.4" height="1.7" rx="0.25" fill="#042f2e"/>
   </g>
   <g transform="translate(156,52)" font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif"
      font-size="78" font-weight="800" letter-spacing="-0.04em">
